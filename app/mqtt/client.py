@@ -3,26 +3,36 @@ import json
 import asyncio
 import logging
 from app.core.config import settings
-# FIX: Import from db.session, not api.dependencies
 from app.db.session import AsyncSessionLocal
 from app.models.domain import Command, CommandStatus
 from sqlalchemy import update
 
 logger = logging.getLogger(__name__)
 
+
 class MQTTManager:
     def __init__(self):
         self.client = mqtt.Client(client_id="gridsphere_backend")
+        self.loop = None  # store main event loop
+
         if settings.MQTT_USER:
             self.client.username_pw_set(settings.MQTT_USER, settings.MQTT_PASS)
-        
+
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
 
     def start(self):
         try:
+            # store current running loop
+            try:
+                self.loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+
             self.client.connect(settings.MQTT_BROKER, settings.MQTT_PORT, 60)
             self.client.loop_start()
+
             logger.info(f"MQTT Client started. Broker: {settings.MQTT_BROKER}")
         except Exception as e:
             logger.error(f"Failed to connect to MQTT Broker: {e}")
@@ -43,10 +53,17 @@ class MQTTManager:
             payload = json.loads(msg.payload.decode())
             command_id = payload.get("cmd_id")
             status = payload.get("status")
-            
+
             if command_id and status:
-                # Use a background task to handle the async DB update
-                asyncio.run(self.update_command_status(command_id, status))
+                # ✅ SAFE async execution (no asyncio.run)
+                if self.loop and self.loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        self.update_command_status(command_id, status),
+                        self.loop
+                    )
+                else:
+                    logger.error("Event loop not available for MQTT async task")
+
         except Exception as e:
             logger.error(f"MQTT Message Error: {e}")
 
@@ -56,22 +73,39 @@ class MQTTManager:
                 await db.execute(
                     update(Command)
                     .where(Command.id == command_id)
-                    .values(status=CommandStatus.SUCCESS if status == "success" else CommandStatus.FAILED)
+                    .values(
+                        status=CommandStatus.SUCCESS
+                        if status == "success"
+                        else CommandStatus.FAILED
+                    )
                 )
                 await db.commit()
+
                 logger.info(f"Updated Command {command_id} status to {status}")
+
             except Exception as e:
                 logger.error(f"Database update error from MQTT: {e}")
                 await db.rollback()
 
-    def publish_command(self, tenant_id: int, device_id: str, command_id: int, command: str, target_id: int):
+    def publish_command(
+        self,
+        tenant_id: int,
+        device_id: str,
+        command_id: int,
+        command: str,
+        target_id: int
+    ):
         topic = f"gridsphere/{tenant_id}/{device_id}/commands"
+
         payload = json.dumps({
-            "cmd_id": command_id, 
-            "command": command, 
+            "cmd_id": command_id,
+            "command": command,
             "target_id": target_id
         })
+
         self.client.publish(topic, payload, qos=1)
+
         logger.info(f"Published command {command} to {topic}")
+
 
 mqtt_manager = MQTTManager()

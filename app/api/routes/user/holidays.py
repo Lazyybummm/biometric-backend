@@ -1,39 +1,63 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from sqlalchemy.future import select
 from app.db.session import get_db
+from app.api.dependencies import get_current_user
+from app.models.domain import User
 
 router = APIRouter()
 
 
+# =========================
+# GET ALL HOLIDAYS
+# =========================
+
 @router.get("/holidays")
-async def get_holidays(db: AsyncSession = Depends(get_db)):
+async def get_holidays(
+    user_id: int = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # 🔑 get tenant from user
+    result = await db.execute(
+        select(User).where(User.id == user_id)
+    )
+    user = result.scalars().first()
+    tenant_id = user.tenant_id
 
     result = await db.execute(text("""
-
         SELECT *
         FROM holidays
+        WHERE tenant_id = :tenant_id
         ORDER BY holiday_date
-
-    """))
+    """), {"tenant_id": tenant_id})
 
     return result.mappings().all()
 
 
+# =========================
+# UPCOMING HOLIDAY
+# =========================
 
 @router.get("/holidays/upcoming")
-async def upcoming_holiday(db: AsyncSession = Depends(get_db)):
+async def upcoming_holiday(
+    user_id: int = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # 🔑 get tenant from user
+    result = await db.execute(
+        select(User).where(User.id == user_id)
+    )
+    user = result.scalars().first()
+    tenant_id = user.tenant_id
 
     result = await db.execute(text("""
-
         SELECT *
         FROM holidays
-
-        WHERE holiday_date >= CURRENT_DATE
-
+        WHERE tenant_id = :tenant_id
+        AND holiday_date >= CURRENT_DATE
         ORDER BY holiday_date
         LIMIT 1
-
-    """))
+    """), {"tenant_id": tenant_id})
 
     return result.mappings().first()

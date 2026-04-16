@@ -25,7 +25,7 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('username', sa.String(), nullable=False),
     sa.Column('api_token', sa.String(), nullable=False),
-    sa.Column('role', sa.Enum('SUPER_ADMIN', 'TENANT_ADMIN', name='roleenum'), nullable=False),
+    sa.Column('role', sa.Enum('super_admin', 'tenant_admin', name='roleenum'), nullable=False),
     sa.Column('tenant_id', sa.Integer(), nullable=True),
     sa.ForeignKeyConstraint(['tenant_id'], ['tenants.id'], ),
     sa.PrimaryKeyConstraint('id')

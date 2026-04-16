@@ -1,43 +1,80 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.api.dependencies import get_db, verify_tenant, verify_device
+from app.api.dependencies import get_db, verify_device
 from app.schemas.schemas import BulkAttendanceRequest, AttendanceLogResponse
-from app.services.attendance_service import process_attendance, process_bulk_attendance, get_attendance_history
+from app.services.attendance_service import (
+    process_attendance,
+    process_bulk_attendance,
+    get_attendance_history
+)
 from typing import List
 
 router = APIRouter()
 
+
+# =========================
+# MARK ATTENDANCE (REAL-TIME)
+# =========================
+
 @router.post("/mark")
 async def mark_attendance(
     finger_id: int,
-    tenant_id: int = Depends(verify_tenant),
-    device: dict = Depends(verify_device),
+    device = Depends(verify_device),
     db: AsyncSession = Depends(get_db)
 ):
-    # Unpack the log and the fetched user_name
-    log, user_name = await process_attendance(tenant_id, device.device_id, finger_id, db)
-    
-    # Send the state and user name right back to the hardware
+    tenant_id = device.tenant_id
+
+    log, user_name = await process_attendance(
+        tenant_id,
+        device.device_id,
+        finger_id,
+        db
+    )
+
     return {
-        "status": "success", 
+        "status": "success",
+        "user_id": log.user_id,                 # ✅ NEW
+        "finger_id": log.finger_id,
         "record_type": log.record_type,
         "user_name": user_name,
         "message": f"Successfully marked {log.record_type}"
     }
 
+
+# =========================
+# OFFLINE SYNC
+# =========================
+
 @router.post("/sync-offline")
 async def sync_offline_attendance(
     payload: BulkAttendanceRequest,
-    tenant_id: int = Depends(verify_tenant),
-    device: dict = Depends(verify_device),
+    device = Depends(verify_device),
     db: AsyncSession = Depends(get_db)
 ):
-    count = await process_bulk_attendance(tenant_id, device.device_id, payload.logs, db)
-    return {"status": "success", "synced_records": count}
+    tenant_id = device.tenant_id
+
+    count = await process_bulk_attendance(
+        tenant_id,
+        device.device_id,
+        payload.logs,
+        db
+    )
+
+    return {
+        "status": "success",
+        "synced_records": count
+    }
+
+
+# =========================
+# HISTORY
+# =========================
 
 @router.get("/history", response_model=List[AttendanceLogResponse])
 async def attendance_history(
-    tenant_id: int = Depends(verify_tenant),
+    device = Depends(verify_device),
     db: AsyncSession = Depends(get_db)
 ):
+    tenant_id = device.tenant_id
+
     return await get_attendance_history(tenant_id, db)

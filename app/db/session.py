@@ -1,18 +1,27 @@
-import sqlalchemy.ext.asyncio
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
-from app.core.config import settings
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+import os
+from sqlalchemy.ext.asyncio import create_async_engine
+from dotenv import load_dotenv
 
-# Database Connection Pool
+load_dotenv()   # 🔥 THIS LINE IS MISSING
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
 engine = create_async_engine(
-    settings.DATABASE_URL, 
-    pool_size=20, 
-    max_overflow=10,
+    DATABASE_URL,
+    echo=True,
     pool_pre_ping=True
 )
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    expire_on_commit=False
+)
+
+Base = declarative_base()
+
 
 async def get_db():
-    """Provides a transactional scope around a series of operations."""
     async with AsyncSessionLocal() as session:
         yield session

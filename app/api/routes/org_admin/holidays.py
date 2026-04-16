@@ -4,6 +4,8 @@ from sqlalchemy import text
 from pydantic import BaseModel
 from datetime import date
 from app.db.session import get_db
+from app.api.dependencies import get_admin_data
+from app.models.domain import AdminUser
 
 router = APIRouter()
 
@@ -25,92 +27,93 @@ class HolidayUpdate(BaseModel):
 # ROUTES
 # ======================
 
-
 # get holidays
 @router.get("/holidays")
-async def get_holidays(db: AsyncSession = Depends(get_db)):
+async def get_holidays(
+    admin: AdminUser = Depends(get_admin_data),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id = admin.tenant_id
 
     result = await db.execute(text("""
         SELECT *
         FROM holidays
+        WHERE tenant_id = :tenant_id
         ORDER BY holiday_date
-    """))
+    """), {"tenant_id": tenant_id})
 
     return result.mappings().all()
 
 
-
-# create holiday (JSON BODY)
+# create holiday
 @router.post("/holidays")
 async def create_holiday(
-        data: HolidayCreate,
-        db: AsyncSession = Depends(get_db)
+    data: HolidayCreate,
+    admin: AdminUser = Depends(get_admin_data),
+    db: AsyncSession = Depends(get_db)
 ):
+    tenant_id = admin.tenant_id
 
     await db.execute(text("""
-
         INSERT INTO holidays
-        (name, holiday_date)
-
+        (tenant_id, name, holiday_date)
         VALUES
-        (:name, :holiday_date)
-
-    """), data.dict())
-
-    await db.commit()
-
-    return {
-        "message": "holiday created"
-    }
-
-
-
-# update holiday (JSON BODY)
-@router.put("/holidays/{holiday_id}")
-async def update_holiday(
-        holiday_id: int,
-        data: HolidayUpdate,
-        db: AsyncSession = Depends(get_db)
-):
-
-    await db.execute(text("""
-
-        UPDATE holidays
-
-        SET name=:name,
-            holiday_date=:holiday_date
-
-        WHERE holiday_id=:holiday_id
-
+        (:tenant_id, :name, :holiday_date)
     """), {
-        "holiday_id": holiday_id,
+        "tenant_id": tenant_id,
         **data.dict()
     })
 
     await db.commit()
 
-    return {
-        "message": "holiday updated"
-    }
+    return {"message": "holiday created"}
 
+
+# update holiday
+@router.put("/holidays/{holiday_id}")
+async def update_holiday(
+    holiday_id: int,
+    data: HolidayUpdate,
+    admin: AdminUser = Depends(get_admin_data),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id = admin.tenant_id
+
+    await db.execute(text("""
+        UPDATE holidays
+        SET name = :name,
+            holiday_date = :holiday_date
+        WHERE holiday_id = :holiday_id
+        AND tenant_id = :tenant_id
+    """), {
+        "holiday_id": holiday_id,
+        "tenant_id": tenant_id,
+        **data.dict()
+    })
+
+    await db.commit()
+
+    return {"message": "holiday updated"}
 
 
 # delete holiday
 @router.delete("/holidays/{holiday_id}")
 async def delete_holiday(
-        holiday_id: int,
-        db: AsyncSession = Depends(get_db)
+    holiday_id: int,
+    admin: AdminUser = Depends(get_admin_data),
+    db: AsyncSession = Depends(get_db)
 ):
+    tenant_id = admin.tenant_id
 
     await db.execute(text("""
         DELETE FROM holidays
-        WHERE holiday_id=:holiday_id
+        WHERE holiday_id = :holiday_id
+        AND tenant_id = :tenant_id
     """), {
-        "holiday_id": holiday_id
+        "holiday_id": holiday_id,
+        "tenant_id": tenant_id
     })
 
     await db.commit()
 
-    return {
-        "message": "holiday deleted"
-    }
+    return {"message": "holiday deleted"}
