@@ -1,240 +1,343 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy import func
+from sqlalchemy.future import select
 from pydantic import BaseModel
 from typing import Optional
+import secrets
+import string
 from app.db.session import get_db
-from app.api.dependencies import get_admin_data
-from app.models.domain import AdminUser
+from app.api.dependencies import get_current_user, require_role
+from app.models.domain import User
+from app.core.security import hash_password
+from app.services.notification_service import create_notification
 
 router = APIRouter()
 
-# =========================
-# SCHEMAS
-# =========================
+
+def generate_strong_password(length: int = 10) -> str:
+    """Generate a strong random password"""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
 
 class EmployeeCreate(BaseModel):
     name: str
-    department_id: int
-    finger_id: int | None = None
-
-
-class EmployeeUpdate(BaseModel):
-    name: str
-    department_id: int
+    employee_code: Optional[str] = None
+    password: Optional[str] = None
     finger_id: Optional[int] = None
 
 
-# =========================
-# ROUTES
-# =========================
+class EmployeeUpdate(BaseModel):
+    name: Optional[str] = None
+    finger_id: Optional[int] = None
+    is_active: Optional[bool] = None
 
-# available fingerprint IDs
-@router.get("/employees/available-finger-ids")
-async def available_finger_ids(
-    admin: AdminUser = Depends(get_admin_data),
+
+class AssignFingerprintRequest(BaseModel):
+    finger_id: int
+
+
+@router.get("/employees/available-finger-slots")
+async def available_finger_slots(
+    current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    tenant_id = admin.tenant_id
-
-    result = await db.execute(text("""
-        SELECT generate_series(1,50) as finger_id
-        EXCEPT
-        SELECT finger_id
-        FROM employees
-        WHERE tenant_id = :tenant_id
-        AND finger_id IS NOT NULL
-        ORDER BY finger_id
-    """), {"tenant_id": tenant_id})
-
-    return result.mappings().all()
+    tenant_id = current_user.tenant_id
+    result = await db.execute(
+        select(User.finger_id).where(User.tenant_id == tenant_id, User.finger_id.isnot(None))
+    )
+    used = set(result.scalars().all())
+    available = [i for i in range(1, 128) if i not in used]
+    return {"used": list(used), "available": available, "total": 127, "free_count": len(available)}
 
 
-# employee statistics
-@router.get("/employees/stats")
-async def employee_stats(
-    admin: AdminUser = Depends(get_admin_data),
-    db: AsyncSession = Depends(get_db)
-):
-    tenant_id = admin.tenant_id
-
-    result = await db.execute(text("""
-        SELECT
-        COUNT(*) as total_employees,
-        COUNT(*) FILTER (WHERE is_active = true) as active_employees,
-        COUNT(*) FILTER (WHERE is_active = false) as inactive_employees
-        FROM employees
-        WHERE tenant_id = :tenant_id
-    """), {"tenant_id": tenant_id})
-
-    return result.mappings().first()
-
-
-# find employee by finger id
-@router.get("/employees/fingerprint/{finger_id}")
-async def employee_by_fingerprint(
-    finger_id: int,
-    admin: AdminUser = Depends(get_admin_data),
-    db: AsyncSession = Depends(get_db)
-):
-    tenant_id = admin.tenant_id
-
-    result = await db.execute(text("""
-        SELECT *
-        FROM employees
-        WHERE tenant_id = :tenant_id
-        AND finger_id = :finger_id
-    """), {
-        "tenant_id": tenant_id,
-        "finger_id": finger_id
-    })
-
-    return result.mappings().first()
-
-
-# get all employees
 @router.get("/employees")
-async def get_employees(
-    admin: AdminUser = Depends(get_admin_data),
+async def list_employees(
+    current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    tenant_id = admin.tenant_id
-
-    result = await db.execute(text("""
-        SELECT *
-        FROM employees
-        WHERE tenant_id = :tenant_id
-        ORDER BY employee_id
-    """), {"tenant_id": tenant_id})
-
-    return result.mappings().all()
+    result = await db.execute(
+        select(User).where(
+            User.tenant_id == current_user.tenant_id,
+            User.dept_id == current_user.dept_id,
+            User.role == "employee"
+        ).order_by(User.name)
+    )
+    return result.scalars().all()
 
 
-# create employee
 @router.post("/employees")
 async def create_employee(
     data: EmployeeCreate,
-    admin: AdminUser = Depends(get_admin_data),
+    current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    tenant_id = admin.tenant_id
-
-    await db.execute(text("""
-        INSERT INTO employees
-        (tenant_id, name, department_id, finger_id, is_active)
-        VALUES
-        (:tenant_id, :name, :department_id, :finger_id, true)
-    """), {
-        "tenant_id": tenant_id,
-        **data.dict()
-    })
-
+    tenant_id = current_user.tenant_id
+    dept_id = current_user.dept_id
+    
+    auto_generated = {"employee_code": False, "finger_id": False, "password": False}
+    
+    # AUTO-GENERATE employee_code
+    if not data.employee_code:
+        count_result = await db.execute(
+            select(func.count()).select_from(User).where(
+                User.tenant_id == tenant_id,
+                User.role == "employee"
+            )
+        )
+        emp_count = count_result.scalar() or 0
+        data.employee_code = f"EMP{tenant_id}{emp_count + 1:03d}"
+        auto_generated["employee_code"] = True
+    
+    # Check employee_code unique
+    existing = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant_id,
+            User.employee_code == data.employee_code
+        )
+    )
+    if existing.scalars().first():
+        raise HTTPException(400, "Employee code already exists")
+    
+    # AUTO-GENERATE password
+    original_password = data.password
+    if not data.password:
+        original_password = generate_strong_password(10)
+        auto_generated["password"] = True
+    
+    # AUTO-ASSIGN finger_id
+    original_finger_id = data.finger_id
+    if data.finger_id is None:
+        used_result = await db.execute(
+            select(User.finger_id).where(
+                User.tenant_id == tenant_id,
+                User.finger_id.isnot(None)
+            )
+        )
+        used = set(used_result.scalars().all())
+        for i in range(1, 128):
+            if i not in used:
+                data.finger_id = i
+                break
+        
+        if data.finger_id is None:
+            raise HTTPException(400, "No available fingerprint slots (1-127 all used)")
+        auto_generated["finger_id"] = True
+    else:
+        finger_check = await db.execute(
+            select(User).where(
+                User.tenant_id == tenant_id,
+                User.finger_id == data.finger_id
+            )
+        )
+        if finger_check.scalars().first():
+            raise HTTPException(400, f"Finger ID {data.finger_id} already assigned")
+    
+    # Create employee
+    user = User(
+        tenant_id=tenant_id,
+        employee_code=data.employee_code,
+        name=data.name,
+        email=None,
+        dept_id=dept_id,
+        finger_id=data.finger_id,
+        role="employee",
+        password_hash=hash_password(original_password)
+    )
+    
+    db.add(user)
     await db.commit()
+    await db.refresh(user)
+    
+    # NOTIFICATION: Notify Org Admin
+    await create_notification(
+        db, tenant_id, current_user.id,
+        "New Employee Added",
+        f"{user.name} ({user.employee_code}) added to your department",
+        "employee"
+    )
+    
+    # NOTIFICATION: Welcome the new employee
+    await create_notification(
+        db, tenant_id, user.id,
+        "Welcome to GridSphere!",
+        f"Your employee code is {user.employee_code}. Please login and change your password.",
+        "system"
+    )
+    
+    return {
+        "message": "Employee created successfully",
+        "credentials": {
+            "name": user.name,
+            "employee_code": user.employee_code,
+            "password": original_password,
+            "finger_id": user.finger_id
+        },
+        "auto_generated": auto_generated,
+        "instructions": "Share these credentials with the employee. They should change password on first login."
+    }
 
-    return {"message": "employee created"}
+
+@router.patch("/employees/{employee_id}/assign-fingerprint")
+async def assign_fingerprint(
+    employee_id: int,
+    data: AssignFingerprintRequest,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id, dept_id = current_user.tenant_id, current_user.dept_id
+    result = await db.execute(
+        select(User).where(
+            User.id == employee_id,
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "employee"
+        )
+    )
+    employee = result.scalars().first()
+    if not employee:
+        raise HTTPException(404, "Employee not found in your department")
+    
+    finger_check = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant_id,
+            User.finger_id == data.finger_id,
+            User.id != employee_id
+        )
+    )
+    if finger_check.scalars().first():
+        raise HTTPException(400, f"Finger ID {data.finger_id} already in use")
+    
+    employee.finger_id = data.finger_id
+    await db.commit()
+    
+    # NOTIFICATION: Notify employee
+    await create_notification(
+        db, tenant_id, employee.id,
+        "Fingerprint Enrolled",
+        f"Your fingerprint has been successfully registered (Slot {data.finger_id})",
+        "employee"
+    )
+    
+    return {
+        "message": f"Fingerprint slot {data.finger_id} assigned",
+        "employee_id": employee.id,
+        "finger_id": data.finger_id
+    }
 
 
-# update employee
-@router.put("/employees/{user_id}")
+@router.put("/employees/{employee_id}")
 async def update_employee(
-    user_id: int,
+    employee_id: int,
     data: EmployeeUpdate,
-    admin: AdminUser = Depends(get_admin_data),
+    current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    tenant_id = admin.tenant_id
-
-    await db.execute(text("""
-        UPDATE employees
-        SET name = :name,
-            department_id = :department_id,
-            finger_id = :finger_id
-        WHERE employee_id = :user_id
-        AND tenant_id = :tenant_id
-    """), {
-        "user_id": user_id,
-        "tenant_id": tenant_id,
-        **data.dict()
-    })
-
+    tenant_id, dept_id = current_user.tenant_id, current_user.dept_id
+    result = await db.execute(
+        select(User).where(
+            User.id == employee_id,
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "employee"
+        )
+    )
+    employee = result.scalars().first()
+    if not employee:
+        raise HTTPException(404, "Employee not found in your department")
+    
+    was_active = employee.is_active
+    
+    if data.name is not None:
+        employee.name = data.name
+    if data.finger_id is not None:
+        if data.finger_id != employee.finger_id:
+            check = await db.execute(
+                select(User).where(
+                    User.tenant_id == tenant_id,
+                    User.finger_id == data.finger_id,
+                    User.id != employee_id
+                )
+            )
+            if check.scalars().first():
+                raise HTTPException(400, "Finger ID already in use")
+        employee.finger_id = data.finger_id
+    if data.is_active is not None:
+        employee.is_active = data.is_active
+        if not data.is_active:
+            employee.finger_id = None
+    
     await db.commit()
+    
+    # NOTIFICATION: If deactivated, notify Org Admin
+    if was_active and employee.is_active is False:
+        await create_notification(
+            db, tenant_id, current_user.id,
+            "Employee Deactivated",
+            f"{employee.name} ({employee.employee_code}) has been deactivated",
+            "employee"
+        )
+    
+    return {"message": "Employee updated successfully"}
 
-    return {"message": "employee updated"}
 
-
-# deactivate employee
-@router.patch("/employees/{user_id}/deactivate")
-async def deactivate_employee(
-    user_id: int,
-    admin: AdminUser = Depends(get_admin_data),
+@router.delete("/employees/{employee_id}")
+async def delete_employee(
+    employee_id: int,
+    current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    tenant_id = admin.tenant_id
-
-    await db.execute(text("""
-        UPDATE employees
-        SET is_active=false,
-            finger_id=NULL
-        WHERE employee_id=:user_id
-        AND tenant_id=:tenant_id
-    """), {
-        "user_id": user_id,
-        "tenant_id": tenant_id
-    })
-
+    tenant_id, dept_id = current_user.tenant_id, current_user.dept_id
+    result = await db.execute(
+        select(User).where(
+            User.id == employee_id,
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "employee"
+        )
+    )
+    employee = result.scalars().first()
+    if not employee:
+        raise HTTPException(404, "Employee not found in your department")
+    
+    employee.is_active = False
+    employee.finger_id = None
     await db.commit()
+    
+    # NOTIFICATION: Notify Org Admin
+    await create_notification(
+        db, tenant_id, current_user.id,
+        "Employee Deactivated",
+        f"{employee.name} ({employee.employee_code}) has been deactivated",
+        "employee"
+    )
+    
+    return {"message": "Employee deactivated successfully"}
 
-    return {"message": "employee deactivated"}
 
-
-# activate employee
-@router.patch("/employees/{user_id}/activate")
-async def activate_employee(
-    user_id: int,
-    admin: AdminUser = Depends(get_admin_data),
+@router.get("/employees/{employee_id}")
+async def get_employee(
+    employee_id: int,
+    current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    tenant_id = admin.tenant_id
-
-    await db.execute(text("""
-        UPDATE employees
-        SET is_active=true
-        WHERE employee_id=:user_id
-        AND tenant_id=:tenant_id
-    """), {
-        "user_id": user_id,
-        "tenant_id": tenant_id
-    })
-
-    await db.commit()
-
-    return {"message": "employee activated"}
-
-
-# employee attendance history
-@router.get("/employees/{user_id}/attendance")
-async def employee_attendance(
-    user_id: int,
-    admin: AdminUser = Depends(get_admin_data),
-    db: AsyncSession = Depends(get_db)
-):
-    tenant_id = admin.tenant_id
-
-    result = await db.execute(text("""
-        SELECT
-            a.finger_id,
-            a.timestamp,
-            a.record_type
-        FROM attendance_logs a
-        JOIN employees e
-        ON a.tenant_id = e.tenant_id
-        AND a.finger_id = e.finger_id
-        WHERE e.employee_id = :user_id
-        AND e.tenant_id = :tenant_id
-        ORDER BY a.timestamp DESC
-    """), {
-        "user_id": user_id,
-        "tenant_id": tenant_id
-    })
-
-    return result.mappings().all()
+    tenant_id, dept_id = current_user.tenant_id, current_user.dept_id
+    result = await db.execute(
+        select(User).where(
+            User.id == employee_id,
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "employee"
+        )
+    )
+    employee = result.scalars().first()
+    if not employee:
+        raise HTTPException(404, "Employee not found in your department")
+    return {
+        "id": employee.id,
+        "name": employee.name,
+        "employee_code": employee.employee_code,
+        "finger_id": employee.finger_id,
+        "is_active": employee.is_active
+    }

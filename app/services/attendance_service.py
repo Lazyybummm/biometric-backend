@@ -73,7 +73,7 @@ async def process_attendance(
         time_diff = now - last_log.timestamp
 
         # 🚨 Prevent duplicate scan within 5 minutes
-        if time_diff < timedelta(minutes=5):
+        if time_diff < timedelta(minutes=1):
             return last_log, user_name
 
         current_type = "OUT" if last_log.record_type == "IN" else "IN"

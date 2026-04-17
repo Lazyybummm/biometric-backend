@@ -9,5 +9,3 @@ paho-mqtt>=1.6.1
 redis>=5.0.1
 python-dotenv>=1.0.0
 greenlet>=3.0.1
-pip uninstall psycopg -y
-pip install "psycopg[binary]"
