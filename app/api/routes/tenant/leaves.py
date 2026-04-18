@@ -5,7 +5,7 @@ from typing import Optional
 from app.db.session import get_db
 from app.api.dependencies import verify_tenant_api_key
 from app.models.domain import Tenant
-from app.services.notification_service import create_notification
+from app.services.notification_service import notify_single_user
 
 router = APIRouter()
 
@@ -87,11 +87,16 @@ async def approve_leave(
     await db.commit()
     
     # NOTIFICATION: Notify employee
-    await create_notification(
-        db, tenant.id, info["employee_id"],
-        "Leave Fully Approved",
-        f"Your {info['leave_type']} leave from {info['start_date']} to {info['end_date']} has been fully approved",
-        "leave"
+    await notify_single_user(
+        db=db,
+        tenant_id=tenant.id,
+        actor_id=None,
+        recipient_id=info["employee_id"],
+        event_type="leave_approved_final",
+        title="Leave Fully Approved",
+        message=f"Your {info['leave_type']} leave from {info['start_date']} to {info['end_date']} has been fully approved",
+        entity_type="Leave",
+        entity_id=leave_id
     )
     
     return {"message": "Leave approved successfully"}
@@ -130,11 +135,16 @@ async def reject_leave(
     if reason:
         message += f". Reason: {reason}"
     
-    await create_notification(
-        db, tenant.id, info["employee_id"],
-        "Leave Rejected",
-        message,
-        "leave"
+    await notify_single_user(
+        db=db,
+        tenant_id=tenant.id,
+        actor_id=None,
+        recipient_id=info["employee_id"],
+        event_type="leave_rejected",
+        title="Leave Rejected",
+        message=message,
+        entity_type="Leave",
+        entity_id=leave_id
     )
     
     return {"message": "Leave rejected"}

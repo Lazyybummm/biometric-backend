@@ -15,15 +15,13 @@ router = APIRouter()
 
 @router.get("/holidays")
 async def get_holidays(
-    user_id: int = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # ← Get full User object
     db: AsyncSession = Depends(get_db)
 ):
-    # 🔑 get tenant from user
-    result = await db.execute(
-        select(User).where(User.id == user_id)
-    )
-    user = result.scalars().first()
-    tenant_id = user.tenant_id
+    """Employee: Get all holidays for their tenant"""
+    
+    # current_user is already the User object, get tenant_id from it
+    tenant_id = current_user.tenant_id
 
     result = await db.execute(text("""
         SELECT *
@@ -41,15 +39,12 @@ async def get_holidays(
 
 @router.get("/holidays/upcoming")
 async def upcoming_holiday(
-    user_id: int = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # ← Get full User object
     db: AsyncSession = Depends(get_db)
 ):
-    # 🔑 get tenant from user
-    result = await db.execute(
-        select(User).where(User.id == user_id)
-    )
-    user = result.scalars().first()
-    tenant_id = user.tenant_id
+    """Employee: Get next upcoming holiday"""
+    
+    tenant_id = current_user.tenant_id
 
     result = await db.execute(text("""
         SELECT *
