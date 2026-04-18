@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func
+from sqlalchemy import func, text, insert
 from sqlalchemy.future import select
 from pydantic import BaseModel
 from typing import Optional
@@ -8,9 +8,8 @@ import secrets
 import string
 from app.db.session import get_db
 from app.api.dependencies import get_current_user, require_role
-from app.models.domain import User
+from app.models.domain import User, Notification
 from app.core.security import hash_password
-from app.services.notification_service import create_notification
 
 router = APIRouter()
 
@@ -37,6 +36,137 @@ class EmployeeUpdate(BaseModel):
 class AssignFingerprintRequest(BaseModel):
     finger_id: int
 
+
+# =========================
+# BACKGROUND TASKS
+# =========================
+
+async def notify_other_admins_bg(
+    tenant_id: int,
+    dept_id: int,
+    actor_id: int,
+    actor_name: str,
+    employee_id: int,
+    employee_name: str,
+    db: AsyncSession
+):
+    """Background task: Notify OTHER org admins about new employee"""
+    
+    # Get other org admins in this department
+    org_admins = await db.execute(text("""
+        SELECT id FROM users
+        WHERE tenant_id = :tenant_id
+        AND dept_id = :dept_id
+        AND role = 'org_admin'
+        AND is_active = true
+        AND id != :actor_id
+    """), {
+        "tenant_id": tenant_id,
+        "dept_id": dept_id,
+        "actor_id": actor_id
+    })
+    admin_ids = [row[0] for row in org_admins.all()]
+    
+    if not admin_ids:
+        return
+    
+    notification_values = []
+    for admin_id in admin_ids:
+        notification_values.append({
+            "tenant_id": tenant_id,
+            "actor_id": actor_id,
+            "actor_name": actor_name,
+            "recipient_id": admin_id,
+            "event_type": "employee_added",
+            "entity_type": "User",
+            "entity_id": employee_id,
+            "entity_name": employee_name,
+            "title": "New Employee Added",
+            "message": f"{employee_name} was added to your department",
+            "is_read": False
+        })
+    
+    await db.execute(insert(Notification).values(notification_values))
+    await db.commit()
+
+
+async def notify_employee_deactivated_bg(
+    tenant_id: int,
+    dept_id: int,
+    actor_id: int,
+    actor_name: str,
+    employee_id: int,
+    employee_name: str,
+    db: AsyncSession
+):
+    """Background task: Notify OTHER org admins about employee deactivation"""
+    
+    org_admins = await db.execute(text("""
+        SELECT id FROM users
+        WHERE tenant_id = :tenant_id
+        AND dept_id = :dept_id
+        AND role = 'org_admin'
+        AND is_active = true
+        AND id != :actor_id
+    """), {
+        "tenant_id": tenant_id,
+        "dept_id": dept_id,
+        "actor_id": actor_id
+    })
+    admin_ids = [row[0] for row in org_admins.all()]
+    
+    if not admin_ids:
+        return
+    
+    notification_values = []
+    for admin_id in admin_ids:
+        notification_values.append({
+            "tenant_id": tenant_id,
+            "actor_id": actor_id,
+            "actor_name": actor_name,
+            "recipient_id": admin_id,
+            "event_type": "employee_deactivated",
+            "entity_type": "User",
+            "entity_id": employee_id,
+            "entity_name": employee_name,
+            "title": "Employee Deactivated",
+            "message": f"{employee_name} has been deactivated",
+            "is_read": False
+        })
+    
+    await db.execute(insert(Notification).values(notification_values))
+    await db.commit()
+
+
+async def notify_fingerprint_enrolled_bg(
+    tenant_id: int,
+    actor_id: int,
+    employee_id: int,
+    employee_name: str,
+    finger_id: int,
+    db: AsyncSession
+):
+    """Background task: Notify employee about fingerprint enrollment"""
+    
+    await db.execute(insert(Notification).values([{
+        "tenant_id": tenant_id,
+        "actor_id": actor_id,
+        "actor_name": "System",
+        "recipient_id": employee_id,
+        "event_type": "fingerprint_enrolled",
+        "entity_type": "User",
+        "entity_id": employee_id,
+        "entity_name": employee_name,
+        "title": "Fingerprint Enrolled",
+        "message": f"Your fingerprint has been successfully registered (Slot {finger_id})",
+        "is_read": False
+    }]))
+    await db.commit()
+
+
+# =========================
+# ROUTES
+# =========================
 
 @router.get("/employees/available-finger-slots")
 async def available_finger_slots(
@@ -70,6 +200,7 @@ async def list_employees(
 @router.post("/employees")
 async def create_employee(
     data: EmployeeCreate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
@@ -107,7 +238,6 @@ async def create_employee(
         auto_generated["password"] = True
     
     # AUTO-ASSIGN finger_id
-    original_finger_id = data.finger_id
     if data.finger_id is None:
         used_result = await db.execute(
             select(User.finger_id).where(
@@ -150,20 +280,16 @@ async def create_employee(
     await db.commit()
     await db.refresh(user)
     
-    # NOTIFICATION: Notify Org Admin
-    await create_notification(
-        db, tenant_id, current_user.id,
-        "New Employee Added",
-        f"{user.name} ({user.employee_code}) added to your department",
-        "employee"
-    )
-    
-    # NOTIFICATION: Welcome the new employee
-    await create_notification(
-        db, tenant_id, user.id,
-        "Welcome to GridSphere!",
-        f"Your employee code is {user.employee_code}. Please login and change your password.",
-        "system"
+    # Schedule notification in BACKGROUND
+    background_tasks.add_task(
+        notify_other_admins_bg,
+        tenant_id=tenant_id,
+        dept_id=dept_id,
+        actor_id=current_user.id,
+        actor_name=current_user.name,
+        employee_id=user.id,
+        employee_name=user.name,
+        db=db
     )
     
     return {
@@ -183,6 +309,7 @@ async def create_employee(
 async def assign_fingerprint(
     employee_id: int,
     data: AssignFingerprintRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
@@ -212,12 +339,15 @@ async def assign_fingerprint(
     employee.finger_id = data.finger_id
     await db.commit()
     
-    # NOTIFICATION: Notify employee
-    await create_notification(
-        db, tenant_id, employee.id,
-        "Fingerprint Enrolled",
-        f"Your fingerprint has been successfully registered (Slot {data.finger_id})",
-        "employee"
+    # Schedule notification in BACKGROUND
+    background_tasks.add_task(
+        notify_fingerprint_enrolled_bg,
+        tenant_id=tenant_id,
+        actor_id=current_user.id,
+        employee_id=employee.id,
+        employee_name=employee.name,
+        finger_id=data.finger_id,
+        db=db
     )
     
     return {
@@ -231,6 +361,7 @@ async def assign_fingerprint(
 async def update_employee(
     employee_id: int,
     data: EmployeeUpdate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
@@ -270,13 +401,17 @@ async def update_employee(
     
     await db.commit()
     
-    # NOTIFICATION: If deactivated, notify Org Admin
+    # Schedule notification in BACKGROUND if deactivated
     if was_active and employee.is_active is False:
-        await create_notification(
-            db, tenant_id, current_user.id,
-            "Employee Deactivated",
-            f"{employee.name} ({employee.employee_code}) has been deactivated",
-            "employee"
+        background_tasks.add_task(
+            notify_employee_deactivated_bg,
+            tenant_id=tenant_id,
+            dept_id=dept_id,
+            actor_id=current_user.id,
+            actor_name=current_user.name,
+            employee_id=employee.id,
+            employee_name=employee.name,
+            db=db
         )
     
     return {"message": "Employee updated successfully"}
@@ -285,6 +420,7 @@ async def update_employee(
 @router.delete("/employees/{employee_id}")
 async def delete_employee(
     employee_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
@@ -305,12 +441,16 @@ async def delete_employee(
     employee.finger_id = None
     await db.commit()
     
-    # NOTIFICATION: Notify Org Admin
-    await create_notification(
-        db, tenant_id, current_user.id,
-        "Employee Deactivated",
-        f"{employee.name} ({employee.employee_code}) has been deactivated",
-        "employee"
+    # Schedule notification in BACKGROUND
+    background_tasks.add_task(
+        notify_employee_deactivated_bg,
+        tenant_id=tenant_id,
+        dept_id=dept_id,
+        actor_id=current_user.id,
+        actor_name=current_user.name,
+        employee_id=employee.id,
+        employee_name=employee.name,
+        db=db
     )
     
     return {"message": "Employee deactivated successfully"}

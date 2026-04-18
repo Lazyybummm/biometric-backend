@@ -1,13 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy import text, insert
 from pydantic import BaseModel
 from datetime import date
 from typing import Optional
 from app.db.session import get_db
 from app.api.dependencies import get_current_user
-from app.models.domain import User
-from app.services.notification_service import create_notification, notify_org_admins
+from app.models.domain import User, Notification
 
 router = APIRouter()
 
@@ -17,6 +16,67 @@ class LeaveApplyRequest(BaseModel):
     start_date: date
     end_date: date
     reason: Optional[str] = None
+
+
+async def create_leave_notifications_bg(
+    tenant_id: int,
+    employee_id: int,
+    employee_name: str,
+    dept_id: int,
+    leave_type: str,
+    start_date: date,
+    end_date: date,
+    db: AsyncSession
+):
+    """Background task: Create all leave notifications"""
+    
+    # Get org admin IDs
+    org_admins = await db.execute(text("""
+        SELECT id FROM users
+        WHERE tenant_id = :tenant_id
+        AND dept_id = :dept_id
+        AND role = 'org_admin'
+        AND is_active = true
+    """), {
+        "tenant_id": tenant_id,
+        "dept_id": dept_id
+    })
+    admin_ids = [row[0] for row in org_admins.all()]
+    
+    notification_values = []
+    
+    # Org admin notifications
+    for admin_id in admin_ids:
+        notification_values.append({
+            "tenant_id": tenant_id,
+            "actor_id": employee_id,
+            "actor_name": employee_name,
+            "recipient_id": admin_id,
+            "event_type": "leave_requested",
+            "entity_type": "Leave",
+            "entity_name": f"{employee_name} ({leave_type})",
+            "title": "New Leave Request",
+            "message": f"{employee_name} requested {leave_type} leave from {start_date} to {end_date}",
+            "is_read": False
+        })
+    
+    # Employee confirmation
+    notification_values.append({
+        "tenant_id": tenant_id,
+        "actor_id": employee_id,
+        "actor_name": employee_name,
+        "recipient_id": employee_id,
+        "event_type": "leave_submitted",
+        "entity_type": "Leave",
+        "entity_name": f"{leave_type} leave",
+        "title": "Leave Request Submitted",
+        "message": f"Your {leave_type} leave request from {start_date} to {end_date} has been submitted",
+        "is_read": False
+    })
+    
+    if notification_values:
+        await db.execute(insert(Notification).values(notification_values))
+        await db.commit()
 
 
 # =========================
@@ -100,12 +160,13 @@ async def get_leaves(
 @router.post("/leaves")
 async def apply_leave(
     data: LeaveApplyRequest,
+    background_tasks: BackgroundTasks,  # ← ADDED
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Employee: Apply for leave"""
+    """Employee: Apply for leave - FAST with background tasks"""
     
-    # Check for overlapping leaves
+    # 1. Check overlapping leaves
     overlap = await db.execute(text("""
         SELECT leave_id FROM leaves
         WHERE employee_id = :user_id
@@ -124,6 +185,7 @@ async def apply_leave(
     if overlap.scalar():
         raise HTTPException(400, "Leave request overlaps with existing leave")
     
+    # 2. Insert leave (SYNCHRONOUS - must happen before response)
     await db.execute(text("""
         INSERT INTO leaves (tenant_id, employee_id, leave_type, start_date, end_date, reason, status)
         VALUES (:tenant_id, :employee_id, :leave_type, :start_date, :end_date, :reason, 'pending')
@@ -137,30 +199,20 @@ async def apply_leave(
     })
     await db.commit()
     
-    # NOTIFICATION: Notify employee
-    try:
-        await create_notification(
-            db, current_user.tenant_id, current_user.id,
-            "Leave Request Submitted",
-            f"Your {data.leave_type} leave request from {data.start_date} to {data.end_date} has been submitted for approval",
-            "leave"
-        )
-        await db.commit()
-    except Exception as e:
-        print(f"Failed to create employee notification: {e}")
+    # 3. Schedule notifications in BACKGROUND
+    background_tasks.add_task(
+        create_leave_notifications_bg,
+        tenant_id=current_user.tenant_id,
+        employee_id=current_user.id,
+        employee_name=current_user.name,
+        dept_id=current_user.dept_id,
+        leave_type=data.leave_type,
+        start_date=data.start_date,
+        end_date=data.end_date,
+        db=db
+    )
     
-    # NOTIFICATION: Notify Org Admins in this department
-    try:
-        await notify_org_admins(
-            db, current_user.tenant_id, current_user.dept_id,
-            "New Leave Request",
-            f"{current_user.name} ({current_user.employee_code}) requested {data.leave_type} leave from {data.start_date} to {data.end_date}",
-            "leave"
-        )
-        await db.commit()
-    except Exception as e:
-        print(f"Failed to create org admin notification: {e}")
-    
+    # 4. Return IMMEDIATELY - user doesn't wait for notifications!
     return {"message": "Leave applied successfully"}
 
 
@@ -195,6 +247,9 @@ async def cancel_leave(
         WHERE leave_id = :leave_id AND employee_id = :user_id
     """), {"leave_id": leave_id, "user_id": current_user.id})
     info = leave_info.mappings().first()
+    
+    if not info:
+        raise HTTPException(404, "Leave request not found")
     
     result = await db.execute(text("""
         UPDATE leaves SET status = 'cancelled'

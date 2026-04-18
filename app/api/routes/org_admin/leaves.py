@@ -1,13 +1,48 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy import text, insert
 from app.db.session import get_db
 from app.api.dependencies import get_current_user, require_role
-from app.models.domain import User
-from app.services.notification_service import create_notification
+from app.models.domain import User, Notification
 
 router = APIRouter()
 
+
+# =========================
+# BACKGROUND TASKS
+# =========================
+
+async def notify_leave_approved_bg(
+    tenant_id: int,
+    approver_id: int,
+    employee_id: int,
+    leave_id: int,
+    leave_type: str,
+    start_date: str,
+    end_date: str,
+    db: AsyncSession
+):
+    """Background task: Notify employee of leave approval"""
+    
+    await db.execute(insert(Notification).values([{
+        "tenant_id": tenant_id,
+        "actor_id": approver_id,
+        "actor_name": "Department Head",
+        "recipient_id": employee_id,
+        "event_type": "leave_approved_dept",
+        "entity_type": "Leave",
+        "entity_id": leave_id,
+        "entity_name": f"{leave_type} leave",
+        "title": "Leave Approved (Department)",
+        "message": f"Your {leave_type} leave from {start_date} to {end_date} was approved by department head",
+        "is_read": False
+    }]))
+    await db.commit()
+
+
+# =========================
+# ROUTES
+# =========================
 
 @router.get("/leaves")
 async def list_department_leaves(
@@ -29,6 +64,7 @@ async def list_department_leaves(
 @router.patch("/leaves/{leave_id}/approve")
 async def approve_leave(
     leave_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
@@ -65,12 +101,17 @@ async def approve_leave(
     
     await db.commit()
     
-    # NOTIFICATION: Notify employee
-    await create_notification(
-        db, current_user.tenant_id, info["employee_id"],
-        "Leave Approved (Department)",
-        f"Your {info['leave_type']} leave from {info['start_date']} to {info['end_date']} was approved by department head",
-        "leave"
+    # Schedule notification in BACKGROUND
+    background_tasks.add_task(
+        notify_leave_approved_bg,
+        tenant_id=current_user.tenant_id,
+        approver_id=current_user.id,
+        employee_id=info["employee_id"],
+        leave_id=leave_id,
+        leave_type=info["leave_type"],
+        start_date=str(info["start_date"]),
+        end_date=str(info["end_date"]),
+        db=db
     )
     
     return {"message": "Leave approved at department level"}

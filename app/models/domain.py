@@ -195,23 +195,6 @@ class Leave(Base):
 
 
 # =========================
-# NOTIFICATIONS
-# =========================
-
-class Notification(Base):
-    __tablename__ = "notifications"
-
-    notification_id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title = Column(String, nullable=False)
-    message = Column(String, nullable=False)
-    type = Column(String, nullable=False)
-    is_read = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
-# =========================
 # SETTINGS
 # =========================
 
@@ -225,3 +208,36 @@ class Settings(Base):
     late_threshold_minutes = Column(Integer, default=15)
     working_days = Column(String, default="1,2,3,4,5")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+# =========================
+# NOTIFICATIONS
+# =========================
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    notification_id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    
+    # Who did it
+    actor_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    actor_name = Column(String, nullable=True)
+    
+    # Who receives it
+    recipient_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    
+    # What happened
+    event_type = Column(String, nullable=False)
+    entity_type = Column(String, nullable=True)
+    entity_id = Column(Integer, nullable=True)
+    entity_name = Column(String, nullable=True)
+    
+    # The message
+    title = Column(String, nullable=False)
+    message = Column(String, nullable=False)
+    
+    # Read status
+    is_read = Column(Boolean, default=False)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

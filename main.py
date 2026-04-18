@@ -14,7 +14,7 @@ from app.api.routes.tenant import (
 )
 from app.api.routes.org_admin import (
     dashboard as org_dashboard, employees as org_employees, attendance as org_attendance,
-    leaves as org_leaves, holidays as org_holidays
+    leaves as org_leaves, holidays as org_holidays , devices as org_devices
 )
 from app.api.routes.employee import (
     dashboard as emp_dashboard, attendance as emp_attendance, profile as emp_profile,
@@ -68,6 +68,7 @@ app.include_router(org_employees.router, prefix="/api/org-admin", tags=["Org Adm
 app.include_router(org_attendance.router, prefix="/api/org-admin", tags=["Org Admin"])
 app.include_router(org_leaves.router, prefix="/api/org-admin", tags=["Org Admin"])
 app.include_router(org_holidays.router, prefix="/api/org-admin", tags=["Org Admin"])
+app.include_router(org_devices.router, prefix="/api/org-admin", tags=["Org Admin"])
 
 app.include_router(emp_dashboard.router, prefix="/api/employee", tags=["Employee"])
 app.include_router(emp_attendance.router, prefix="/api/employee", tags=["Employee"])

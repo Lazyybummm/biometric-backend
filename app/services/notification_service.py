@@ -1,137 +1,214 @@
 """
-Notification Service - Handles creation of notifications for various events
+Notification Service - Single table design with per-recipient rows
 """
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy.future import select
+from sqlalchemy import text, func
 from typing import List, Optional
+from app.models.domain import Notification, User
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-async def create_notification(
+async def create_notifications_for_recipients(
     db: AsyncSession,
     tenant_id: int,
-    user_id: int,
+    actor_id: int,
+    recipient_ids: List[int],
+    event_type: str,
     title: str,
     message: str,
-    notification_type: str
-):
-    """Create a single notification for a specific user"""
-    try:
-        await db.execute(text("""
-            INSERT INTO notifications (tenant_id, user_id, title, message, type, is_read)
-            VALUES (:tenant_id, :user_id, :title, :message, :type, false)
-        """), {
-            "tenant_id": tenant_id,
-            "user_id": user_id,
-            "title": title,
-            "message": message,
-            "type": notification_type
-        })
-        await db.commit()
-        logger.info(f"Notification created for user {user_id}: {title}")
-    except Exception as e:
-        logger.error(f"Failed to create notification: {e}")
-        await db.rollback()
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """
+    Create notification rows for multiple recipients.
+    Each recipient gets their own row with independent read status.
+    """
+    
+    # Get actor name once (denormalize)
+    actor_name = None
+    if actor_id:
+        result = await db.execute(
+            select(User.name).where(User.id == actor_id)
+        )
+        actor_name = result.scalar() or "System"
+    else:
+        actor_name = "System"
+    
+    # Batch insert - one row per recipient
+    count = 0
+    for recipient_id in recipient_ids:
+        notification = Notification(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            recipient_id=recipient_id,
+            event_type=event_type,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            entity_name=entity_name,
+            title=title,
+            message=message,
+            is_read=False
+        )
+        db.add(notification)
+        count += 1
+    
+    await db.commit()
+    logger.info(f"Created {count} notifications for event '{event_type}'")
+    return count
 
 
-async def create_notification_for_role(
-    db: AsyncSession,
-    tenant_id: int,
-    role: str,
-    title: str,
-    message: str,
-    notification_type: str,
-    dept_id: Optional[int] = None
-):
-    """Create notifications for all users with a specific role"""
-    try:
-        query = """
-            INSERT INTO notifications (tenant_id, user_id, title, message, type, is_read)
-            SELECT :tenant_id, id, :title, :message, :type, false
-            FROM users
-            WHERE tenant_id = :tenant_id
-            AND role = :role
-            AND is_active = true
-        """
-        params = {
-            "tenant_id": tenant_id,
-            "title": title,
-            "message": message,
-            "type": notification_type,
-            "role": role
-        }
-        
-        if dept_id is not None:
-            query += " AND dept_id = :dept_id"
-            params["dept_id"] = dept_id
-        
-        await db.execute(text(query), params)
-        await db.commit()
-        logger.info(f"Notifications created for role {role} in tenant {tenant_id}")
-    except Exception as e:
-        logger.error(f"Failed to create role notifications: {e}")
-        await db.rollback()
-
-
-async def broadcast_to_tenant(
-    db: AsyncSession,
-    tenant_id: int,
-    title: str,
-    message: str,
-    notification_type: str,
-    roles: Optional[List[str]] = None
-):
-    """Broadcast notification to entire tenant or specific roles"""
-    try:
-        query = """
-            INSERT INTO notifications (tenant_id, user_id, title, message, type, is_read)
-            SELECT :tenant_id, id, :title, :message, :type, false
-            FROM users
-            WHERE tenant_id = :tenant_id
-            AND is_active = true
-        """
-        params = {
-            "tenant_id": tenant_id,
-            "title": title,
-            "message": message,
-            "type": notification_type
-        }
-        
-        if roles:
-            query += " AND role = ANY(:roles)"
-            params["roles"] = roles
-        
-        await db.execute(text(query), params)
-        await db.commit()
-        logger.info(f"Broadcast notification sent in tenant {tenant_id}")
-    except Exception as e:
-        logger.error(f"Failed to broadcast notification: {e}")
-        await db.rollback()
-
-
-async def notify_employee(
-    db: AsyncSession,
-    tenant_id: int,
-    employee_id: int,
-    title: str,
-    message: str,
-    notification_type: str
-):
-    """Shortcut for notifying an employee"""
-    await create_notification(db, tenant_id, employee_id, title, message, notification_type)
-
-
-async def notify_org_admins(
+async def notify_department_admins_except_actor(
     db: AsyncSession,
     tenant_id: int,
     dept_id: int,
+    actor_id: int,
+    event_type: str,
+    title: str,
+    message_template: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """
+    Notify all Org Admins in a department EXCEPT the actor.
+    Each admin gets their own notification row.
+    """
+    
+    # Get all org admins in this department EXCEPT the actor
+    result = await db.execute(
+        select(User.id).where(
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "org_admin",
+            User.is_active == True,
+            User.id != actor_id
+        )
+    )
+    admins = result.all()
+    
+    if not admins:
+        logger.info(f"No other org admins to notify in dept {dept_id}")
+        return 0
+    
+    recipient_ids = [admin[0] for admin in admins]
+    message = message_template.format(entity_name=entity_name or "Unknown")
+    
+    return await create_notifications_for_recipients(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        recipient_ids=recipient_ids,
+        event_type=event_type,
+        title=title,
+        message=message,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_name=entity_name
+    )
+
+
+async def notify_all_department_admins(
+    db: AsyncSession,
+    tenant_id: int,
+    dept_id: int,
+    actor_id: int,
+    event_type: str,
+    title: str,
+    message_template: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """
+    Notify ALL Org Admins in a department (including the actor).
+    Used for leave requests where actor is employee, not admin.
+    """
+    
+    result = await db.execute(
+        select(User.id).where(
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "org_admin",
+            User.is_active == True
+        )
+    )
+    admins = result.all()
+    
+    if not admins:
+        logger.info(f"No org admins to notify in dept {dept_id}")
+        return 0
+    
+    recipient_ids = [admin[0] for admin in admins]
+    message = message_template.format(entity_name=entity_name or "Unknown")
+    
+    return await create_notifications_for_recipients(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        recipient_ids=recipient_ids,
+        event_type=event_type,
+        title=title,
+        message=message,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_name=entity_name
+    )
+
+
+async def notify_single_user(
+    db: AsyncSession,
+    tenant_id: int,
+    actor_id: int,
+    recipient_id: int,
+    event_type: str,
     title: str,
     message: str,
-    notification_type: str
-):
-    """Notify all org admins in a department"""
-    await create_notification_for_role(
-        db, tenant_id, "org_admin", title, message, notification_type, dept_id
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """Notify a single user"""
+    return await create_notifications_for_recipients(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        recipient_ids=[recipient_id],
+        event_type=event_type,
+        title=title,
+        message=message,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_name=entity_name
+    )
+
+
+async def notify_multiple_users(
+    db: AsyncSession,
+    tenant_id: int,
+    actor_id: int,
+    recipient_ids: List[int],
+    event_type: str,
+    title: str,
+    message: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """Notify multiple specific users"""
+    return await create_notifications_for_recipients(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        recipient_ids=recipient_ids,
+        event_type=event_type,
+        title=title,
+        message=message,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_name=entity_name
     )
