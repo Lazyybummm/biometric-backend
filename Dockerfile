@@ -1,27 +1,26 @@
 FROM python:3.11-slim
 
-# Keep Python from buffering and generating pyc files
+# Prevent Python from writing .pyc files and buffering stdout/stderr
 ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
 
 WORKDIR /app
 
-# Install system dependencies for PostgreSQL driver
+# Install system dependencies for PostgreSQL
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install requirements
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all project files
+# Copy project files
 COPY . .
 
-# Expose port 8000 internally
+# Expose port 8000 for the FastAPI app
 EXPOSE 8000
 
-# Start command
-# We use 'alembic upgrade head' to ensure the external DB has your latest tables
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# Start Uvicorn directly to bypass the Alembic crash
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
