@@ -24,7 +24,7 @@ services:
       # We use 'db' as the hostname because Docker links them internally
       - DATABASE_URL=postgresql+asyncpg://grid:strongpassword@db:5432/biometric
     ports:
-      - "8080:8000" # Your site will be accessible at http://your-vps-ip:8080
+      - "8081:8000" # Your site will be accessible at http://your-vps-ip:8080
 
 volumes:
   postgres_data:
