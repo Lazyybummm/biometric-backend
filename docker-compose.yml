@@ -1,19 +1,30 @@
 version: '3.8'
 
 services:
-  api:
-    build: .
-    container_name: biometri_api
+  db:
+    image: postgres:15-alpine
+    container_name: biometric_db
     restart: always
-    ports:
-      - "8001:8000"
     environment:
-      # --- NEON DB (Loaded securely from your .env file) ---
-      - DATABASE_URL=${DATABASE_URL}
-      
-      # --- MQTT BROKER ---
-      # (Update the broker domain here if you also renamed your MQTT server for Biometri)
-      - MQTT_BROKER=mqtt.gridsphere.in 
-      - MQTT_PORT=1883
-      - MQTT_USER=esp8266
-      - MQTT_PASS=strongpassword123
+      POSTGRES_USER: grid
+      POSTGRES_PASSWORD: strongpassword
+      POSTGRES_DB: biometric
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432" # Mapped to 5433 to avoid the occupied 5432 port
+
+  backend:
+    build: .
+    container_name: biometric_backend
+    restart: always
+    depends_on:
+      - db
+    environment:
+      # We use 'db' as the hostname because Docker links them internally
+      - DATABASE_URL=postgresql+asyncpg://grid:strongpassword@db:5432/biometric
+    ports:
+      - "8080:8000" # Your site will be accessible at http://your-vps-ip:8080
+
+volumes:
+  postgres_data:

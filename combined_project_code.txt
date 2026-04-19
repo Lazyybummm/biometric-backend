@@ -1,0 +1,5889 @@
+
+================================================================================
+FILE: core/config.py
+================================================================================
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "GridSphere IoT Core"
+    DATABASE_URL: str
+    REDIS_URL: str
+    
+    MQTT_BROKER: str
+    MQTT_PORT: int = 1883
+    MQTT_USER: str = ""
+    MQTT_PASS: str = ""
+    
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+settings = Settings()
+
+================================================================================
+FILE: core/security.py
+================================================================================
+
+"""
+Security module for GridSphere IoT Core
+Handles password hashing, JWT token creation/validation, and cryptography
+"""
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+from datetime import datetime, timedelta
+import uuid
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+# =====================
+# CONFIGURATION
+# =====================
+
+# SECRET_KEY should be set via environment variable in production
+SECRET_KEY = os.getenv("SECRET_KEY", "CHANGE_THIS_SECRET_IN_PRODUCTION")
+ALGORITHM = "HS256"
+
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+
+# =====================
+# PASSWORD HASHING CONTEXT
+# =====================
+
+# Configure bcrypt with explicit settings for production compatibility
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto",
+    bcrypt__rounds=12,  # Balance between security and performance
+    bcrypt__ident="2b"  # Force bcrypt 2b algorithm
+)
+
+
+# =====================
+# PASSWORD UTILITIES
+# =====================
+
+def _truncate_password(password: str, max_bytes: int = 72) -> str:
+    """
+    Truncate password to max_bytes for bcrypt compatibility.
+    bcrypt has a 72-byte limit on password length.
+    """
+    password_bytes = password.encode('utf-8')
+    if len(password_bytes) > max_bytes:
+        # Truncate at byte level, not character level
+        truncated = password_bytes[:max_bytes].decode('utf-8', errors='ignore')
+        logger.warning(f"Password truncated from {len(password_bytes)} to {max_bytes} bytes")
+        return truncated
+    return password
+
+
+def hash_password(password: str) -> str:
+    """
+    Hash a password using bcrypt.
+    
+    Args:
+        password: Plain text password
+        
+    Returns:
+        Hashed password string
+    """
+    if not password:
+        raise ValueError("Password cannot be empty")
+    
+    # Truncate for bcrypt compatibility
+    truncated = _truncate_password(password)
+    
+    try:
+        return pwd_context.hash(truncated)
+    except Exception as e:
+        logger.error(f"Password hashing failed: {e}")
+        raise ValueError(f"Failed to hash password: {e}")
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    """
+    Verify a password against its hash.
+    
+    Args:
+        password: Plain text password to verify
+        hashed: Stored hash to compare against
+        
+    Returns:
+        True if password matches, False otherwise
+    """
+    if not password or not hashed:
+        return False
+    
+    # Truncate for bcrypt compatibility (same as during hashing)
+    truncated = _truncate_password(password)
+    
+    try:
+        return pwd_context.verify(truncated, hashed)
+    except Exception as e:
+        logger.error(f"Password verification failed: {e}")
+        return False
+
+
+def validate_password_strength(password: str) -> tuple[bool, str]:
+    """
+    Validate password meets security requirements.
+    
+    Args:
+        password: Password to validate
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters"
+    
+    if not any(c.isupper() for c in password):
+        return False, "Password must contain at least one uppercase letter"
+    
+    if not any(c.islower() for c in password):
+        return False, "Password must contain at least one lowercase letter"
+    
+    if not any(c.isdigit() for c in password):
+        return False, "Password must contain at least one number"
+    
+    return True, ""
+
+
+# =====================
+# JWT TOKEN UTILITIES
+# =====================
+
+def create_access_token(data: dict) -> str:
+    """
+    Create a new JWT access token.
+    
+    Args:
+        data: Payload data to encode
+        
+    Returns:
+        Encoded JWT token string
+    """
+    payload = data.copy()
+    payload["type"] = "access"
+    payload["jti"] = str(uuid.uuid4())  # Unique token ID for revocation
+    payload["iat"] = datetime.utcnow()  # Issued at
+    payload["exp"] = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_refresh_token(data: dict) -> tuple[str, str]:
+    """
+    Create a new JWT refresh token.
+    
+    Args:
+        data: Payload data to encode
+        
+    Returns:
+        Tuple of (refresh_token_string, jti)
+        jti is stored in DB for rotation/revocation
+    """
+    payload = data.copy()
+    payload["type"] = "refresh"
+    jti = str(uuid.uuid4())
+    payload["jti"] = jti
+    payload["iat"] = datetime.utcnow()
+    payload["exp"] = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    
+    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return token, jti
+
+
+def decode_token(token: str) -> dict | None:
+    """
+    Decode and validate a JWT token.
+    
+    Args:
+        token: JWT token string
+        
+    Returns:
+        Decoded payload dict if valid, None if invalid/expired
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        logger.info("Token has expired")
+        return None
+    except jwt.JWTError as e:
+        logger.warning(f"Invalid token: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error decoding token: {e}")
+        return None
+
+
+def get_token_remaining_seconds(token: str) -> int | None:
+    """
+    Get remaining validity time of a token in seconds.
+    
+    Args:
+        token: JWT token string
+        
+    Returns:
+        Seconds until expiration, or None if invalid
+    """
+    payload = decode_token(token)
+    if not payload or "exp" not in payload:
+        return None
+    
+    exp_timestamp = payload["exp"]
+    exp_datetime = datetime.fromtimestamp(exp_timestamp)
+    remaining = exp_datetime - datetime.utcnow()
+    
+    return max(0, int(remaining.total_seconds()))
+
+
+def is_token_expiring_soon(token: str, threshold_minutes: int = 5) -> bool:
+    """
+    Check if token is about to expire.
+    
+    Args:
+        token: JWT token string
+        threshold_minutes: Minutes before expiration to consider "soon"
+        
+    Returns:
+        True if token expires within threshold
+    """
+    remaining = get_token_remaining_seconds(token)
+    if remaining is None:
+        return True
+    
+    return remaining < (threshold_minutes * 60)
+
+
+# =====================
+# SECURITY HEADERS (For Middleware)
+# =====================
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "Content-Security-Policy": "default-src 'self'",
+}
+
+
+# =====================
+# PRODUCTION WARNINGS
+# =====================
+
+def check_production_settings() -> list[str]:
+    """
+    Check if security settings are production-ready.
+    Returns list of warnings.
+    """
+    warnings = []
+    
+    if SECRET_KEY == "CHANGE_THIS_SECRET_IN_PRODUCTION":
+        warnings.append("SECRET_KEY is using default value - CHANGE IT!")
+    
+    if len(SECRET_KEY) < 32:
+        warnings.append("SECRET_KEY should be at least 32 characters")
+    
+    if ACCESS_TOKEN_EXPIRE_MINUTES > 60:
+        warnings.append("Access token expiration > 60 minutes - consider reducing")
+    
+    return warnings
+
+
+# Log warnings on startup
+_warnings = check_production_settings()
+for warning in _warnings:
+    logger.warning(f"⚠️ SECURITY: {warning}")
+
+================================================================================
+FILE: models/domain.py
+================================================================================
+
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Index, Enum, UniqueConstraint, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.sql import func
+import enum
+
+Base = declarative_base()
+
+
+# =========================
+# ENUMS
+# =========================
+
+class CommandStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
+class UserRole(str, enum.Enum):
+    SUPER_ADMIN = "super_admin"
+    ORG_ADMIN = "org_admin"
+    DEPT_ADMIN = "dept_admin"
+    EMPLOYEE = "employee"
+
+
+# =========================
+# TENANT
+# =========================
+
+class Tenant(Base):
+    __tablename__ = "tenants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    api_key = Column(String, unique=True, index=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# =========================
+# DEPARTMENT
+# =========================
+
+class Department(Base):
+    __tablename__ = "departments"
+
+    department_id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    department_name = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'department_name', name='uix_tenant_dept_name'),
+    )
+
+
+# =========================
+# DEVICE
+# =========================
+
+class Device(Base):
+    __tablename__ = "devices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    device_id = Column(String, index=True, nullable=False)
+    secret_key = Column(String, nullable=False)
+    status = Column(String, default="offline")
+    last_seen = Column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index('ix_tenant_device', 'tenant_id', 'device_id', unique=True),
+    )
+
+
+# =========================
+# USER
+# =========================
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True)
+    employee_code = Column(String, nullable=True, index=True)
+    finger_id = Column(Integer, nullable=True)
+
+    name = Column(String, nullable=False)
+    email = Column(String, nullable=True)
+    password_hash = Column(String, nullable=True)
+    dept_id = Column(Integer, ForeignKey("departments.department_id"), nullable=True)
+    role = Column(String, default="employee")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index('ix_tenant_finger', 'tenant_id', 'finger_id', unique=True, postgresql_where=(finger_id.isnot(None))),
+        Index('ix_tenant_employee_code', 'tenant_id', 'employee_code', unique=True),
+    )
+
+
+# =========================
+# ATTENDANCE LOG
+# =========================
+
+class AttendanceLog(Base):
+    __tablename__ = "attendance_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    device_id = Column(String, nullable=False)
+
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    finger_id = Column(Integer, nullable=False)
+
+    record_type = Column(String, nullable=False, default="IN")
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index('ix_tenant_timestamp', 'tenant_id', 'timestamp'),
+        UniqueConstraint('tenant_id', 'device_id', 'finger_id', 'timestamp', name='uix_attendance_record')
+    )
+
+
+# =========================
+# COMMAND
+# =========================
+
+class Command(Base):
+    __tablename__ = "commands"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    device_id = Column(String, nullable=False)
+    command = Column(String, nullable=False)
+    target_id = Column(Integer, nullable=True)
+    status = Column(Enum(CommandStatus, name="commandstatus", values_callable=lambda x: [e.value for e in x]), default=CommandStatus.PENDING)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# =========================
+# REFRESH TOKEN
+# =========================
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    token_jti = Column(String, unique=True, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    is_revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# =========================
+# HOLIDAYS
+# =========================
+
+class Holiday(Base):
+    __tablename__ = "holidays"
+
+    holiday_id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    name = Column(String, nullable=False)
+    holiday_date = Column(DateTime, nullable=False)
+    description = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint('tenant_id', 'holiday_date', name='uix_tenant_holiday_date'),)
+
+
+# =========================
+# LEAVES
+# =========================
+
+class Leave(Base):
+    __tablename__ = "leaves"
+
+    leave_id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    employee_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    leave_type = Column(String, nullable=False)
+    start_date = Column(DateTime, nullable=False)
+    end_date = Column(DateTime, nullable=False)
+    reason = Column(String, nullable=True)
+    status = Column(String, default="pending")
+    dept_approved_at = Column(DateTime(timezone=True), nullable=True)
+    dept_approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    approved_by = Column(Integer, nullable=True)
+    rejected_at = Column(DateTime(timezone=True), nullable=True)
+    rejection_reason = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# =========================
+# SETTINGS
+# =========================
+
+class Settings(Base):
+    __tablename__ = "settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, unique=True)
+    office_start_time = Column(String, default="09:00:00")
+    office_end_time = Column(String, default="18:00:00")
+    late_threshold_minutes = Column(Integer, default=15)
+    working_days = Column(String, default="1,2,3,4,5")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+# =========================
+# NOTIFICATIONS
+# =========================
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    notification_id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    
+    # Who did it
+    actor_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    actor_name = Column(String, nullable=True)
+    
+    # Who receives it
+    recipient_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    
+    # What happened
+    event_type = Column(String, nullable=False)
+    entity_type = Column(String, nullable=True)
+    entity_id = Column(Integer, nullable=True)
+    entity_name = Column(String, nullable=True)
+    
+    # The message
+    title = Column(String, nullable=False)
+    message = Column(String, nullable=False)
+    
+    # Read status
+    is_read = Column(Boolean, default=False)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+================================================================================
+FILE: schemas/schemas.py
+================================================================================
+
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import datetime
+from app.models.domain import CommandStatus
+
+
+# =========================
+# USERS
+# =========================
+
+class UserEnrollRequest(BaseModel):
+    finger_id: int = Field(..., ge=1, le=127)
+    name: str
+    employee_code: str
+    password: Optional[str] = None  # ✅ NEW
+    target_tenant_id: Optional[int] = None
+
+class UserDeleteRequest(BaseModel):
+    finger_id: int = Field(..., ge=1, le=127)
+    target_tenant_id: Optional[int] = None
+
+
+# =========================
+# DEVICES
+# =========================
+
+class DeviceRegisterRequest(BaseModel):
+    device_id: str
+    secret_key: str
+
+
+class DeviceResponse(BaseModel):
+    device_id: str
+    status: str
+    last_seen: Optional[datetime.datetime]
+
+
+# =========================
+# ATTENDANCE
+# =========================
+
+class SyncItem(BaseModel):
+    finger_id: int
+    timestamp: datetime.datetime
+
+
+class BulkAttendanceRequest(BaseModel):
+    logs: List[SyncItem]
+
+
+class AttendanceLogResponse(BaseModel):
+    timestamp: datetime.datetime
+    finger_id: int
+    device_id: str
+    record_type: str
+
+    # ✅ NEW (important)
+    user_id: Optional[int] = None
+    employee_code: Optional[str] = None
+
+    # existing
+    user_name: Optional[str] = "Unknown"
+
+
+# =========================
+# COMMANDS
+# =========================
+
+class CommandRequest(BaseModel):
+    device_id: str
+    command: str
+    target_id: Optional[int] = None
+
+class HolidayCreate(BaseModel):
+    name: str
+    holiday_date: datetime.date
+    description: Optional[str] = None
+
+
+class HolidayResponse(BaseModel):
+    holiday_id: int
+    name: str
+    holiday_date: datetime.date
+    description: Optional[str] = None
+
+class LeaveApplyRequest(BaseModel):
+    leave_type: str
+    start_date: datetime.date
+    end_date: datetime.date
+    reason: Optional[str] = None
+
+
+class LeaveResponse(BaseModel):
+    leave_id: int
+    employee_id: int
+    employee_name: str
+    leave_type: str
+    start_date: datetime.date
+    end_date: datetime.date
+    reason: Optional[str]
+    status: str
+    created_at: datetime.datetime
+
+class NotificationResponse(BaseModel):
+    notification_id: int
+    title: str
+    message: str
+    type: str
+    is_read: bool
+    created_at: datetime.datetime
+
+class SettingsResponse(BaseModel):
+    office_start_time: str
+    office_end_time: str
+    late_threshold_minutes: int
+    working_days: str
+
+
+class SettingsUpdateRequest(BaseModel):
+    office_start_time: Optional[str] = "09:00:00"
+    office_end_time: Optional[str] = "18:00:00"
+    late_threshold_minutes: Optional[int] = 15
+    working_days: Optional[str] = "1,2,3,4,5"
+
+
+================================================================================
+FILE: db/session.py
+================================================================================
+
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+import os
+from sqlalchemy.ext.asyncio import create_async_engine
+from dotenv import load_dotenv
+
+load_dotenv()   # 🔥 THIS LINE IS MISSING
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=True,
+    pool_pre_ping=True
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    expire_on_commit=False
+)
+
+Base = declarative_base()
+
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+================================================================================
+FILE: api/dependencies.py
+================================================================================
+
+from fastapi import Header, HTTPException, Depends
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from app.db.session import get_db
+from app.models.domain import Device, User, Tenant
+from app.core.security import decode_token
+import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> User:
+    payload = decode_token(token)
+    if not payload or payload.get("type") != "access":
+        raise HTTPException(401, "Invalid or expired token")
+    
+    user_id = payload.get("user_id")
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalars().first()
+    
+    if not user or not user.is_active:
+        raise HTTPException(401, "User not found or inactive")
+    
+    return user
+
+
+def require_role(*allowed_roles: str):
+    async def checker(current_user: User = Depends(get_current_user)):
+        if current_user.role not in allowed_roles:
+            raise HTTPException(403, f"Requires one of: {allowed_roles}")
+        return current_user
+    return checker
+
+
+async def require_super_admin(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "super_admin":
+        raise HTTPException(403, "Only super admin can access this")
+    return current_user
+
+
+async def require_org_admin(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "org_admin":
+        raise HTTPException(403, "Only org admin can access this")
+    return current_user
+
+
+async def require_employee(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "employee":
+        raise HTTPException(403, "Only employees can access this")
+    return current_user
+
+
+async def verify_tenant_api_key(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+    db: AsyncSession = Depends(get_db)
+) -> Tenant:
+    result = await db.execute(select(Tenant).where(Tenant.api_key == x_api_key))
+    tenant = result.scalars().first()
+    if not tenant:
+        raise HTTPException(401, "Invalid API key")
+    return tenant
+
+
+async def verify_tenant_jwt(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+) -> Tenant:
+    if current_user.role != "tenant_admin":
+        raise HTTPException(403, "Tenant access required")
+    result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
+    tenant = result.scalars().first()
+    if not tenant:
+        raise HTTPException(401, "Tenant not found")
+    return tenant
+
+
+async def verify_device(
+    x_device_id: str = Header(..., alias="x-device-id"),
+    x_secret_key: str = Header(..., alias="x-secret-key"),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(Device).where(Device.device_id == x_device_id, Device.secret_key == x_secret_key)
+    )
+    device = result.scalars().first()
+    if not device:
+        raise HTTPException(401, "Invalid Device Credentials")
+    device.last_seen = datetime.datetime.utcnow()
+    device.status = "online"
+    await db.commit()
+    return device
+
+
+async def get_admin_data(current_user: User = Depends(require_super_admin)):
+    class CompatibleAdmin:
+        def __init__(self, user):
+            self.id = user.id
+            self.tenant_id = user.tenant_id
+            self.username = user.email or user.name
+            self.role = "super_admin"
+    return CompatibleAdmin(current_user)
+
+================================================================================
+FILE: api/routes/auth.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import text, or_
+from app.db.session import get_db
+from app.models.domain import User, RefreshToken, Tenant
+from app.api.dependencies import get_current_user
+from pydantic import BaseModel, EmailStr, field_validator
+from app.core.security import (
+    verify_password,
+    hash_password,
+    create_access_token,
+    create_refresh_token,
+    decode_token
+)
+from datetime import datetime, timedelta
+import secrets
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+# =========================
+# SCHEMAS
+# =========================
+
+class LoginRequest(BaseModel):
+    """JSON login - accepts employee_code OR email"""
+    identifier: str
+    password: str
+    tenant_id: int | None = None
+
+
+class TenantLoginRequest(BaseModel):
+    """Tenant manager login using API key"""
+    api_key: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class SetPasswordRequest(BaseModel):
+    user_id: int
+    new_password: str
+    
+    @field_validator('new_password')
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters')
+        if not re.search(r'[A-Z]', v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not re.search(r'[a-z]', v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search(r'[0-9]', v):
+            raise ValueError('Password must contain at least one number')
+        return v
+
+
+class ChangePasswordRequest(BaseModel):
+    """Change own password"""
+    old_password: str
+    new_password: str
+    
+    @field_validator('new_password')
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters')
+        if not re.search(r'[A-Z]', v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not re.search(r'[a-z]', v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search(r'[0-9]', v):
+            raise ValueError('Password must contain at least one number')
+        return v
+
+
+class CreateSuperAdminRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters')
+        if not re.search(r'[A-Z]', v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not re.search(r'[a-z]', v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search(r'[0-9]', v):
+            raise ValueError('Password must contain at least one number')
+        return v
+
+
+# =========================
+# HELPER FUNCTIONS
+# =========================
+
+def _create_auth_response(user: User, db_session: AsyncSession = None) -> dict:
+    """Helper to create consistent auth response"""
+    payload = {
+        "user_id": user.id,
+        "role": user.role,
+        "tenant_id": user.tenant_id,
+        "dept_id": user.dept_id
+    }
+    
+    access_token = create_access_token(payload)
+    refresh_token, jti = create_refresh_token(payload)
+    
+    if db_session:
+        expires_at = datetime.utcnow() + timedelta(days=7)
+        token_record = RefreshToken(
+            user_id=user.id,
+            token_jti=jti,
+            expires_at=expires_at
+        )
+        db_session.add(token_record)
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+
+# =========================
+# UNIFIED OAUTH2 LOGIN
+# =========================
+
+@router.post("/login")
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: AsyncSession = Depends(get_db)
+):
+    """Unified login for ALL users (Super Admin, Org Admin, Employee, Tenant)"""
+    
+    try:
+        # 1. Try Users table (Super Admin, Org Admin, Employee)
+        query = select(User).where(
+            or_(
+                User.employee_code == form_data.username,
+                User.email == form_data.username
+            )
+        )
+        result = await db.execute(query)
+        user = result.scalars().first()
+        
+        if user and user.password_hash:
+            if not verify_password(form_data.password, user.password_hash):
+                raise HTTPException(401, "Invalid credentials")
+            
+            if not user.is_active:
+                raise HTTPException(403, "Account is deactivated")
+            
+            logger.info(f"User login: {user.email or user.employee_code} ({user.role})")
+            return _create_auth_response(user, db)
+        
+        # 2. Try API Key (Tenant Manager)
+        result = await db.execute(
+            select(Tenant).where(Tenant.api_key == form_data.password)
+        )
+        tenant = result.scalars().first()
+        
+        if tenant:
+            payload = {
+                "user_id": tenant.id,
+                "role": "tenant_admin",
+                "tenant_id": tenant.id
+            }
+            
+            access_token = create_access_token(payload)
+            refresh_token, jti = create_refresh_token(payload)
+            
+            logger.info(f"Tenant login via API key: {tenant.name}")
+            
+            return {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "bearer"
+            }
+        
+        logger.warning(f"Failed login: {form_data.username}")
+        raise HTTPException(401, "Invalid credentials")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}")
+        await db.rollback()
+        raise HTTPException(500, "Internal server error")
+
+
+# =========================
+# TENANT LOGIN (API Key)
+# =========================
+
+@router.post("/tenant-login")
+async def tenant_login(
+    data: TenantLoginRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Dedicated login for tenant managers using API key"""
+    
+    try:
+        result = await db.execute(
+            select(Tenant).where(Tenant.api_key == data.api_key)
+        )
+        tenant = result.scalars().first()
+        
+        if not tenant:
+            raise HTTPException(401, "Invalid API key")
+        
+        payload = {
+            "user_id": tenant.id,
+            "role": "tenant_admin",
+            "tenant_id": tenant.id
+        }
+        
+        access_token = create_access_token(payload)
+        refresh_token, jti = create_refresh_token(payload)
+        
+        logger.info(f"Tenant login: {tenant.name}")
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "tenant": {"id": tenant.id, "name": tenant.name}
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Tenant login error: {str(e)}")
+        raise HTTPException(500, "Internal server error")
+
+
+# =========================
+# REFRESH TOKEN
+# =========================
+
+@router.post("/refresh")
+async def refresh_token(
+    data: RefreshRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Refresh access token"""
+    
+    try:
+        payload = decode_token(data.refresh_token)
+        if not payload or payload.get("type") != "refresh":
+            raise HTTPException(401, "Invalid refresh token")
+        
+        jti = payload.get("jti")
+        user_id = payload.get("user_id")
+        
+        result = await db.execute(
+            select(RefreshToken).where(
+                RefreshToken.token_jti == jti,
+                RefreshToken.user_id == user_id
+            )
+        )
+        token_record = result.scalars().first()
+        
+        if not token_record or token_record.is_revoked:
+            raise HTTPException(401, "Token revoked or not found")
+        
+        if token_record.expires_at < datetime.utcnow():
+            raise HTTPException(401, "Token expired")
+        
+        token_record.is_revoked = True
+        
+        new_payload = {
+            "user_id": user_id,
+            "role": payload.get("role"),
+            "tenant_id": payload.get("tenant_id"),
+            "dept_id": payload.get("dept_id")
+        }
+        
+        new_access = create_access_token(new_payload)
+        new_refresh, new_jti = create_refresh_token(new_payload)
+        
+        expires_at = datetime.utcnow() + timedelta(days=7)
+        new_token = RefreshToken(
+            user_id=user_id,
+            token_jti=new_jti,
+            expires_at=expires_at
+        )
+        db.add(new_token)
+        await db.commit()
+        
+        return {
+            "access_token": new_access,
+            "refresh_token": new_refresh,
+            "token_type": "bearer"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Refresh error: {str(e)}")
+        await db.rollback()
+        raise HTTPException(500, "Internal server error")
+
+
+# =========================
+# LOGOUT
+# =========================
+
+@router.post("/logout")
+async def logout(
+    refresh_token: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Revoke refresh token"""
+    
+    try:
+        payload = decode_token(refresh_token)
+        if payload and payload.get("jti"):
+            await db.execute(
+                text("UPDATE refresh_tokens SET is_revoked = TRUE WHERE token_jti = :jti"),
+                {"jti": payload["jti"]}
+            )
+            await db.commit()
+        
+        return {"message": "Logged out"}
+        
+    except Exception as e:
+        logger.error(f"Logout error: {str(e)}")
+        await db.rollback()
+        raise HTTPException(500, "Internal server error")
+
+
+# =========================
+# CREATE SUPER ADMIN
+# =========================
+
+@router.post("/setup/super-admin")
+async def create_super_admin(
+    data: CreateSuperAdminRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """One-time setup - creates first super admin"""
+    
+    try:
+        # Check if super admin already exists
+        result = await db.execute(
+            select(User).where(User.role == "super_admin")
+        )
+        if result.scalars().first():
+            raise HTTPException(400, "Super admin already exists")
+        
+        # Check email
+        email_check = await db.execute(
+            select(User).where(User.email == data.email)
+        )
+        if email_check.scalars().first():
+            raise HTTPException(400, "Email already in use")
+        
+        # Create super admin
+        user = User(
+            tenant_id=None,
+            email=data.email,
+            name=data.name,
+            employee_code=None,
+            finger_id=None,
+            password_hash=hash_password(data.password),
+            role="super_admin",
+            is_active=True
+        )
+        
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        
+        logger.info(f"Super admin created: {data.email}")
+        
+        return {
+            "message": "Super admin created",
+            "user_id": user.id,
+            "email": user.email
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Super admin error: {str(e)}")
+        await db.rollback()
+        raise HTTPException(500, "Internal server error")
+
+
+# =========================
+# CHANGE PASSWORD
+# =========================
+
+@router.post("/change-password")
+async def change_password(
+    data: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """User changes own password"""
+    
+    try:
+        if not current_user.password_hash:
+            raise HTTPException(400, "No password set")
+        
+        if not verify_password(data.old_password, current_user.password_hash):
+            raise HTTPException(401, "Incorrect current password")
+        
+        current_user.password_hash = hash_password(data.new_password)
+        await db.commit()
+        
+        logger.info(f"Password changed for user: {current_user.id}")
+        return {"message": "Password changed"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Change password error: {str(e)}")
+        await db.rollback()
+        raise HTTPException(500, "Internal server error")
+
+
+# =========================
+# SET PASSWORD (Admin only)
+# =========================
+
+@router.post("/set-password")
+async def set_password(
+    data: SetPasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Admin sets password for a user"""
+    
+    if current_user.role not in ["super_admin", "org_admin"]:
+        raise HTTPException(403, "Admin access required")
+    
+    try:
+        result = await db.execute(select(User).where(User.id == data.user_id))
+        user = result.scalars().first()
+        
+        if not user:
+            raise HTTPException(404, "User not found")
+        
+        user.password_hash = hash_password(data.new_password)
+        await db.commit()
+        
+        return {"message": "Password set successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Set password error: {str(e)}")
+        await db.rollback()
+        raise HTTPException(500, "Internal server error")
+
+================================================================================
+FILE: api/routes/attendance.py
+================================================================================
+
+from fastapi import APIRouter, Depends, BackgroundTasks
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.api.dependencies import get_db, verify_device
+from app.schemas.schemas import BulkAttendanceRequest, AttendanceLogResponse
+from app.services.attendance_service import (
+    process_attendance,
+    process_bulk_attendance,
+    get_attendance_history
+)
+from app.services.notification_service import notify_single_user
+from typing import List
+
+router = APIRouter()
+
+
+async def create_attendance_notifications_bg(
+    tenant_id: int,
+    user_id: int,
+    log_id: int,
+    record_type: str,
+    punch_time: str,
+    is_late: bool,
+    db: AsyncSession
+):
+    """Background task: Create attendance notifications"""
+    
+    # Notify employee of punch
+    await notify_single_user(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=None,
+        recipient_id=user_id,
+        event_type="attendance_marked",
+        title=f"Attendance {record_type}",
+        message=f"You punched {record_type} at {punch_time}",
+        entity_type="Attendance",
+        entity_id=log_id
+    )
+    
+    # Late arrival notification
+    if is_late:
+        await notify_single_user(
+            db=db,
+            tenant_id=tenant_id,
+            actor_id=None,
+            recipient_id=user_id,
+            event_type="late_arrival",
+            title="Late Arrival",
+            message=f"You arrived late today at {punch_time}",
+            entity_type="Attendance",
+            entity_id=log_id
+        )
+
+
+@router.post("/mark")
+async def mark_attendance(
+    finger_id: int,
+    background_tasks: BackgroundTasks,  # ← ADDED
+    device = Depends(verify_device),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id = device.tenant_id
+
+    log, user_name = await process_attendance(
+        tenant_id,
+        device.device_id,
+        finger_id,
+        db
+    )
+    
+    # Schedule notifications in BACKGROUND
+    if log.user_id:
+        punch_time = log.timestamp.strftime("%H:%M")
+        is_late = (log.record_type == "IN" and 
+                   log.timestamp.time() > log.timestamp.replace(hour=9, minute=15, second=0).time())
+        
+        background_tasks.add_task(
+            create_attendance_notifications_bg,
+            tenant_id=tenant_id,
+            user_id=log.user_id,
+            log_id=log.id,
+            record_type=log.record_type,
+            punch_time=punch_time,
+            is_late=is_late,
+            db=db
+        )
+
+    return {
+        "status": "success",
+        "user_id": log.user_id,
+        "finger_id": log.finger_id,
+        "record_type": log.record_type,
+        "user_name": user_name,
+        "message": f"Successfully marked {log.record_type}"
+    }
+
+
+@router.post("/sync-offline")
+async def sync_offline_attendance(
+    payload: BulkAttendanceRequest,
+    device = Depends(verify_device),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id = device.tenant_id
+    count = await process_bulk_attendance(tenant_id, device.device_id, payload.logs, db)
+    return {"status": "success", "synced_records": count}
+
+
+@router.get("/history", response_model=List[AttendanceLogResponse])
+async def attendance_history(
+    device = Depends(verify_device),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id = device.tenant_id
+    return await get_attendance_history(tenant_id, db)
+
+================================================================================
+FILE: api/routes/tenant/attendance.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from datetime import date
+from typing import Optional
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant
+
+router = APIRouter()
+
+
+@router.get("/attendance/today")
+async def today_attendance(
+    dept_id: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: View today's attendance"""
+    
+    query = """
+        SELECT 
+            u.id,
+            u.name,
+            u.employee_code,
+            d.department_name,
+            MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
+            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out,
+            CASE 
+                WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') IS NOT NULL 
+                THEN 'present' 
+                ELSE 'absent' 
+            END as status,
+            CASE 
+                WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN')::time > '09:15:00'
+                THEN 'late'
+                ELSE 'on_time'
+            END as punctuality
+        FROM users u
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        LEFT JOIN attendance_logs a ON u.id = a.user_id 
+            AND DATE(a.timestamp) = CURRENT_DATE
+        WHERE u.tenant_id = :tenant_id
+        AND u.role = 'employee'
+        AND u.is_active = true
+    """
+    
+    params = {"tenant_id": tenant.id}
+    
+    if dept_id:
+        query += " AND u.dept_id = :dept_id"
+        params["dept_id"] = dept_id
+    
+    query += " GROUP BY u.id, d.department_name ORDER BY u.name"
+    
+    result = await db.execute(text(query), params)
+    return result.mappings().all()
+
+
+@router.get("/attendance/date/{attendance_date}")
+async def attendance_by_date(
+    attendance_date: date,
+    dept_id: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: View attendance for a specific date"""
+    
+    query = """
+        SELECT 
+            u.id,
+            u.name,
+            u.employee_code,
+            d.department_name,
+            MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
+            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out,
+            CASE 
+                WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') IS NOT NULL 
+                THEN 'present' 
+                ELSE 'absent' 
+            END as status
+        FROM users u
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        LEFT JOIN attendance_logs a ON u.id = a.user_id 
+            AND DATE(a.timestamp) = :attendance_date
+        WHERE u.tenant_id = :tenant_id
+        AND u.role = 'employee'
+        AND u.is_active = true
+    """
+    
+    params = {
+        "tenant_id": tenant.id,
+        "attendance_date": attendance_date
+    }
+    
+    if dept_id:
+        query += " AND u.dept_id = :dept_id"
+        params["dept_id"] = dept_id
+    
+    query += " GROUP BY u.id, d.department_name ORDER BY u.name"
+    
+    result = await db.execute(text(query), params)
+    return result.mappings().all()
+
+
+@router.get("/attendance/summary")
+async def attendance_summary(
+    month: int,
+    year: int,
+    dept_id: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get monthly attendance summary"""
+    
+    query = """
+        SELECT 
+            u.id,
+            u.name,
+            u.employee_code,
+            d.department_name,
+            COUNT(DISTINCT DATE(a.timestamp)) FILTER (WHERE a.record_type = 'IN') as days_present,
+            COUNT(DISTINCT DATE(a.timestamp)) FILTER (
+                WHERE a.record_type = 'IN' 
+                AND EXTRACT(HOUR FROM a.timestamp) >= 9 
+                AND EXTRACT(MINUTE FROM a.timestamp) > 15
+            ) as days_late,
+            COUNT(DISTINCT DATE(a.timestamp)) FILTER (WHERE a.record_type = 'IN') as total_days
+        FROM users u
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        LEFT JOIN attendance_logs a ON u.id = a.user_id 
+            AND EXTRACT(MONTH FROM a.timestamp) = :month
+            AND EXTRACT(YEAR FROM a.timestamp) = :year
+        WHERE u.tenant_id = :tenant_id
+        AND u.role = 'employee'
+        AND u.is_active = true
+    """
+    
+    params = {
+        "tenant_id": tenant.id,
+        "month": month,
+        "year": year
+    }
+    
+    if dept_id:
+        query += " AND u.dept_id = :dept_id"
+        params["dept_id"] = dept_id
+    
+    query += " GROUP BY u.id, d.department_name ORDER BY u.name"
+    
+    result = await db.execute(text(query), params)
+    return result.mappings().all()
+
+
+@router.get("/attendance/stats")
+async def attendance_statistics(
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get overall attendance statistics"""
+    
+    if not month or not year:
+        month = date.today().month
+        year = date.today().year
+    
+    result = await db.execute(text("""
+        WITH daily_stats AS (
+            SELECT 
+                DATE(timestamp) as day,
+                COUNT(DISTINCT user_id) as present_count,
+                COUNT(DISTINCT user_id) FILTER (
+                    WHERE timestamp::time <= '09:15:00'
+                ) as on_time_count
+            FROM attendance_logs
+            WHERE tenant_id = :tenant_id
+            AND record_type = 'IN'
+            AND EXTRACT(MONTH FROM timestamp) = :month
+            AND EXTRACT(YEAR FROM timestamp) = :year
+            GROUP BY DATE(timestamp)
+        )
+        SELECT 
+            COUNT(DISTINCT day) as total_working_days,
+            AVG(present_count) as avg_daily_present,
+            AVG(on_time_count) as avg_daily_on_time,
+            MAX(present_count) as max_present,
+            MIN(present_count) as min_present
+        FROM daily_stats
+    """), {
+        "tenant_id": tenant.id,
+        "month": month,
+        "year": year
+    })
+    
+    return result.mappings().first()
+
+================================================================================
+FILE: api/routes/tenant/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: api/routes/tenant/org_admins.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import text
+from pydantic import BaseModel, EmailStr
+from typing import Optional
+import secrets
+import string
+
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant, Department, User
+from app.core.security import hash_password
+
+router = APIRouter()
+
+
+# =========================
+# HELPER
+# =========================
+
+def generate_strong_password(length: int = 12) -> str:
+    """Generate a strong random password"""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+# =========================
+# SCHEMAS
+# =========================
+
+class OrgAdminCreate(BaseModel):
+    name: str
+    email: EmailStr  # This is the unique username
+    dept_id: int
+    # No password field - auto-generated
+
+
+class OrgAdminUpdate(BaseModel):
+    name: Optional[str] = None
+    dept_id: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+# =========================
+# ROUTES
+# =========================
+
+@router.get("/org-admins")
+async def list_org_admins(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: List all org admins"""
+    
+    result = await db.execute(text("""
+        SELECT 
+            u.id,
+            u.name,
+            u.email,
+            u.dept_id,
+            d.department_name,
+            u.is_active,
+            u.created_at,
+            COUNT(e.id) FILTER (WHERE e.role = 'employee') as employee_count
+        FROM users u
+        JOIN departments d ON u.dept_id = d.department_id
+        LEFT JOIN users e ON e.dept_id = u.dept_id AND e.role = 'employee'
+        WHERE u.tenant_id = :tenant_id
+        AND u.role = 'org_admin'
+        GROUP BY u.id, d.department_name
+        ORDER BY u.name
+    """), {"tenant_id": tenant.id})
+    
+    return result.mappings().all()
+
+
+@router.post("/org-admins")
+async def create_org_admin(
+    data: OrgAdminCreate,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Create org admin - just name, email, department. Password auto-generated."""
+    
+    # Verify department belongs to tenant
+    dept_result = await db.execute(
+        select(Department).where(
+            Department.department_id == data.dept_id,
+            Department.tenant_id == tenant.id,
+            Department.is_active == True
+        )
+    )
+    if not dept_result.scalars().first():
+        raise HTTPException(400, "Invalid or inactive department")
+    
+    # Check email unique (username)
+    existing = await db.execute(
+        select(User).where(User.email == data.email)
+    )
+    if existing.scalars().first():
+        raise HTTPException(400, "Email already exists")
+    
+    # Auto-generate password
+    auto_password = generate_strong_password(12)
+    
+    # Create org admin
+    org_admin = User(
+        tenant_id=tenant.id,
+        name=data.name,
+        email=data.email,
+        password_hash=hash_password(auto_password),
+        dept_id=data.dept_id,
+        role="org_admin",
+        employee_code=None,
+        finger_id=None,
+        is_active=True
+    )
+    
+    db.add(org_admin)
+    await db.commit()
+    await db.refresh(org_admin)
+    
+    return {
+        "message": "Org admin created successfully",
+        "org_admin": {
+            "id": org_admin.id,
+            "name": org_admin.name,
+            "email": org_admin.email,
+            "dept_id": org_admin.dept_id,
+            "role": org_admin.role
+        },
+        "credentials": {
+            "email": org_admin.email,
+            "password": auto_password
+        },
+        "instructions": "Share these credentials. They can change password after first login via /api/auth/change-password"
+    }
+
+
+@router.put("/org-admins/{admin_id}")
+async def update_org_admin(
+    admin_id: int,
+    data: OrgAdminUpdate,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Update org admin"""
+    
+    result = await db.execute(
+        select(User).where(
+            User.id == admin_id,
+            User.tenant_id == tenant.id,
+            User.role == "org_admin"
+        )
+    )
+    org_admin = result.scalars().first()
+    
+    if not org_admin:
+        raise HTTPException(404, "Org admin not found")
+    
+    if data.name is not None:
+        org_admin.name = data.name
+    
+    if data.dept_id is not None:
+        dept_result = await db.execute(
+            select(Department).where(
+                Department.department_id == data.dept_id,
+                Department.tenant_id == tenant.id
+            )
+        )
+        if not dept_result.scalars().first():
+            raise HTTPException(400, "Invalid department")
+        org_admin.dept_id = data.dept_id
+    
+    if data.is_active is not None:
+        org_admin.is_active = data.is_active
+    
+    await db.commit()
+    
+    return {"message": "Org admin updated successfully"}
+
+
+@router.delete("/org-admins/{admin_id}")
+async def delete_org_admin(
+    admin_id: int,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Deactivate org admin"""
+    
+    result = await db.execute(
+        select(User).where(
+            User.id == admin_id,
+            User.tenant_id == tenant.id,
+            User.role == "org_admin"
+        )
+    )
+    org_admin = result.scalars().first()
+    
+    if not org_admin:
+        raise HTTPException(404, "Org admin not found")
+    
+    org_admin.is_active = False
+    await db.commit()
+    
+    return {"message": "Org admin deactivated successfully"}
+
+================================================================================
+FILE: api/routes/tenant/dashboard.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant
+
+router = APIRouter()
+
+
+@router.get("/dashboard")
+async def tenant_dashboard(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: View organization dashboard"""
+    
+    # Department stats
+    dept_stats = await db.execute(text("""
+        SELECT 
+            COUNT(*) as total_departments,
+            COUNT(*) FILTER (WHERE is_active = true) as active_departments
+        FROM departments
+        WHERE tenant_id = :tenant_id
+    """), {"tenant_id": tenant.id})
+    dept_data = dept_stats.mappings().first()
+    
+    # User stats
+    user_stats = await db.execute(text("""
+        SELECT 
+            COUNT(*) FILTER (WHERE role = 'org_admin') as org_admins,
+            COUNT(*) FILTER (WHERE role = 'employee' AND is_active = true) as active_employees,
+            COUNT(*) FILTER (WHERE role = 'employee' AND finger_id IS NOT NULL) as enrolled_employees
+        FROM users
+        WHERE tenant_id = :tenant_id
+    """), {"tenant_id": tenant.id})
+    user_data = user_stats.mappings().first()
+    
+    # Today's attendance
+    att_stats = await db.execute(text("""
+        SELECT 
+            COUNT(DISTINCT user_id) as present_today,
+            COUNT(DISTINCT user_id) FILTER (
+                WHERE timestamp::time <= '09:15:00'
+            ) as on_time,
+            COUNT(DISTINCT user_id) FILTER (
+                WHERE timestamp::time > '09:15:00'
+            ) as late
+        FROM attendance_logs
+        WHERE tenant_id = :tenant_id
+        AND DATE(timestamp) = CURRENT_DATE
+        AND record_type = 'IN'
+    """), {"tenant_id": tenant.id})
+    att_data = att_stats.mappings().first()
+    
+    # Recent activity
+    recent = await db.execute(text("""
+        SELECT 
+            u.name,
+            u.employee_code,
+            d.department_name,
+            a.timestamp,
+            a.record_type
+        FROM attendance_logs a
+        JOIN users u ON a.user_id = u.id
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        WHERE a.tenant_id = :tenant_id
+        ORDER BY a.timestamp DESC
+        LIMIT 10
+    """), {"tenant_id": tenant.id})
+    recent_activity = recent.mappings().all()
+    
+    return {
+        "organization": tenant.name,
+        "departments": {
+            "total": dept_data["total_departments"] or 0,
+            "active": dept_data["active_departments"] or 0
+        },
+        "users": {
+            "org_admins": user_data["org_admins"] or 0,
+            "active_employees": user_data["active_employees"] or 0,
+            "enrolled_employees": user_data["enrolled_employees"] or 0
+        },
+        "attendance_today": {
+            "present": att_data["present_today"] or 0,
+            "on_time": att_data["on_time"] or 0,
+            "late": att_data["late"] or 0
+        },
+        "recent_activity": recent_activity
+    }
+
+================================================================================
+FILE: api/routes/tenant/leaves.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from typing import Optional
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant
+from app.services.notification_service import notify_single_user
+
+router = APIRouter()
+
+
+@router.get("/leaves")
+async def list_leave_requests(
+    status: Optional[str] = None,
+    dept_id: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: List all leave requests"""
+    query = """
+        SELECT l.leave_id, l.employee_id, u.name as employee_name, u.employee_code,
+            d.department_name, l.leave_type, l.start_date, l.end_date, l.reason, l.status, l.created_at
+        FROM leaves l
+        JOIN users u ON l.employee_id = u.id
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        WHERE l.tenant_id = :tenant_id
+    """
+    params = {"tenant_id": tenant.id}
+    
+    if status:
+        query += " AND l.status = :status"
+        params["status"] = status
+    if dept_id:
+        query += " AND u.dept_id = :dept_id"
+        params["dept_id"] = dept_id
+    
+    query += " ORDER BY l.created_at DESC"
+    
+    result = await db.execute(text(query), params)
+    return result.mappings().all()
+
+
+@router.get("/leaves/pending")
+async def pending_leaves(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get pending leave requests count"""
+    result = await db.execute(text("""
+        SELECT COUNT(*) as pending_count
+        FROM leaves
+        WHERE tenant_id = :tenant_id AND status = 'pending'
+    """), {"tenant_id": tenant.id})
+    return result.mappings().first()
+
+
+@router.patch("/leaves/{leave_id}/approve")
+async def approve_leave(
+    leave_id: int,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Approve a leave request (final approval)"""
+    
+    # Get leave details
+    leave_info = await db.execute(text("""
+        SELECT l.employee_id, l.leave_type, l.start_date, l.end_date
+        FROM leaves l
+        WHERE l.leave_id = :leave_id AND l.tenant_id = :tenant_id
+    """), {"leave_id": leave_id, "tenant_id": tenant.id})
+    info = leave_info.mappings().first()
+    
+    if not info:
+        raise HTTPException(404, "Leave request not found")
+    
+    result = await db.execute(text("""
+        UPDATE leaves
+        SET status = 'approved', approved_at = NOW(), approved_by = :tenant_id
+        WHERE leave_id = :leave_id AND tenant_id = :tenant_id
+        AND status IN ('pending', 'approved_by_dept')
+    """), {"leave_id": leave_id, "tenant_id": tenant.id})
+    
+    if result.rowcount == 0:
+        raise HTTPException(404, "Leave request not found or cannot be approved")
+    
+    await db.commit()
+    
+    # NOTIFICATION: Notify employee
+    await notify_single_user(
+        db=db,
+        tenant_id=tenant.id,
+        actor_id=None,
+        recipient_id=info["employee_id"],
+        event_type="leave_approved_final",
+        title="Leave Fully Approved",
+        message=f"Your {info['leave_type']} leave from {info['start_date']} to {info['end_date']} has been fully approved",
+        entity_type="Leave",
+        entity_id=leave_id
+    )
+    
+    return {"message": "Leave approved successfully"}
+
+
+@router.patch("/leaves/{leave_id}/reject")
+async def reject_leave(
+    leave_id: int,
+    reason: str = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Reject a leave request"""
+    
+    # Get leave details
+    leave_info = await db.execute(text("""
+        SELECT l.employee_id, l.leave_type, l.start_date, l.end_date
+        FROM leaves l
+        WHERE l.leave_id = :leave_id AND l.tenant_id = :tenant_id
+    """), {"leave_id": leave_id, "tenant_id": tenant.id})
+    info = leave_info.mappings().first()
+    
+    result = await db.execute(text("""
+        UPDATE leaves
+        SET status = 'rejected', rejection_reason = :reason, rejected_at = NOW()
+        WHERE leave_id = :leave_id AND tenant_id = :tenant_id
+    """), {"leave_id": leave_id, "tenant_id": tenant.id, "reason": reason})
+    
+    if result.rowcount == 0:
+        raise HTTPException(404, "Leave request not found")
+    
+    await db.commit()
+    
+    # NOTIFICATION: Notify employee
+    message = f"Your {info['leave_type']} leave from {info['start_date']} to {info['end_date']} was rejected"
+    if reason:
+        message += f". Reason: {reason}"
+    
+    await notify_single_user(
+        db=db,
+        tenant_id=tenant.id,
+        actor_id=None,
+        recipient_id=info["employee_id"],
+        event_type="leave_rejected",
+        title="Leave Rejected",
+        message=message,
+        entity_type="Leave",
+        entity_id=leave_id
+    )
+    
+    return {"message": "Leave rejected"}
+
+
+@router.get("/leaves/stats")
+async def leave_statistics(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get leave statistics"""
+    result = await db.execute(text("""
+        SELECT 
+            COUNT(*) as total_requests,
+            COUNT(*) FILTER (WHERE status = 'pending') as pending,
+            COUNT(*) FILTER (WHERE status = 'approved_by_dept') as dept_approved,
+            COUNT(*) FILTER (WHERE status = 'approved') as approved,
+            COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
+            COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
+        FROM leaves
+        WHERE tenant_id = :tenant_id
+    """), {"tenant_id": tenant.id})
+    return result.mappings().first()
+
+================================================================================
+FILE: api/routes/tenant/reports.py
+================================================================================
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from typing import Optional
+from datetime import date
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant
+
+router = APIRouter()
+
+
+@router.get("/reports/attendance")
+async def attendance_report(
+    start_date: date,
+    end_date: date,
+    dept_id: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Generate attendance report for date range"""
+    
+    query = """
+        SELECT 
+            u.id,
+            u.name,
+            u.employee_code,
+            d.department_name,
+            COUNT(DISTINCT DATE(a.timestamp)) FILTER (WHERE a.record_type = 'IN') as days_present,
+            COUNT(DISTINCT DATE(a.timestamp)) FILTER (
+                WHERE a.record_type = 'IN' 
+                AND a.timestamp::time > '09:15:00'
+            ) as days_late
+        FROM users u
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        LEFT JOIN attendance_logs a ON u.id = a.user_id 
+            AND DATE(a.timestamp) BETWEEN :start_date AND :end_date
+        WHERE u.tenant_id = :tenant_id
+        AND u.role = 'employee'
+        AND u.is_active = true
+    """
+    
+    params = {
+        "tenant_id": tenant.id,
+        "start_date": start_date,
+        "end_date": end_date
+    }
+    
+    if dept_id:
+        query += " AND u.dept_id = :dept_id"
+        params["dept_id"] = dept_id
+    
+    query += " GROUP BY u.id, d.department_name ORDER BY u.name"
+    
+    result = await db.execute(text(query), params)
+    return result.mappings().all()
+
+
+@router.get("/reports/department-summary")
+async def department_summary(
+    month: int,
+    year: int,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get department-wise attendance summary"""
+    
+    result = await db.execute(text("""
+        SELECT 
+            d.department_id,
+            d.department_name,
+            COUNT(DISTINCT u.id) as total_employees,
+            AVG(att.days_present) as avg_attendance_percentage
+        FROM departments d
+        LEFT JOIN users u ON d.department_id = u.dept_id 
+            AND u.role = 'employee' 
+            AND u.is_active = true
+        LEFT JOIN (
+            SELECT 
+                user_id,
+                COUNT(DISTINCT DATE(timestamp)) * 100.0 / 
+                (SELECT COUNT(DISTINCT DATE(timestamp)) 
+                 FROM attendance_logs 
+                 WHERE EXTRACT(MONTH FROM timestamp) = :month
+                 AND EXTRACT(YEAR FROM timestamp) = :year) as days_present
+            FROM attendance_logs
+            WHERE EXTRACT(MONTH FROM timestamp) = :month
+            AND EXTRACT(YEAR FROM timestamp) = :year
+            AND record_type = 'IN'
+            GROUP BY user_id
+        ) att ON u.id = att.user_id
+        WHERE d.tenant_id = :tenant_id
+        AND d.is_active = true
+        GROUP BY d.department_id, d.department_name
+        ORDER BY d.department_name
+    """), {
+        "tenant_id": tenant.id,
+        "month": month,
+        "year": year
+    })
+    
+    return result.mappings().all()
+
+
+@router.get("/reports/export")
+async def export_report(
+    report_type: str,
+    start_date: date,
+    end_date: date,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Export report data"""
+    
+    # This is a placeholder - you can implement CSV generation here
+    return {
+        "message": f"Export ready for {report_type}",
+        "format": "csv",
+        "date_range": {
+            "start": start_date,
+            "end": end_date
+        }
+    }
+
+================================================================================
+FILE: api/routes/tenant/settings.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from pydantic import BaseModel
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant
+
+router = APIRouter()
+
+
+# =========================
+# SCHEMAS
+# =========================
+
+class SettingsUpdate(BaseModel):
+    office_start_time: str = "09:00:00"
+    office_end_time: str = "18:00:00"
+    late_threshold_minutes: int = 15
+    working_days: str = "1,2,3,4,5"  # Mon-Fri
+
+
+# =========================
+# ROUTES
+# =========================
+
+@router.get("/settings")
+async def get_settings(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get organization settings"""
+    
+    result = await db.execute(text("""
+        SELECT *
+        FROM settings
+        WHERE tenant_id = :tenant_id
+        LIMIT 1
+    """), {"tenant_id": tenant.id})
+    
+    settings = result.mappings().first()
+    
+    if not settings:
+        # Return defaults
+        return {
+            "office_start_time": "09:00:00",
+            "office_end_time": "18:00:00",
+            "late_threshold_minutes": 15,
+            "working_days": "1,2,3,4,5"
+        }
+    
+    return settings
+
+
+@router.put("/settings")
+async def update_settings(
+    data: SettingsUpdate,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Update organization settings"""
+    
+    # Upsert settings
+    await db.execute(text("""
+        INSERT INTO settings (tenant_id, office_start_time, office_end_time, late_threshold_minutes, working_days)
+        VALUES (:tenant_id, :office_start_time, :office_end_time, :late_threshold_minutes, :working_days)
+        ON CONFLICT (tenant_id) DO UPDATE SET
+            office_start_time = EXCLUDED.office_start_time,
+            office_end_time = EXCLUDED.office_end_time,
+            late_threshold_minutes = EXCLUDED.late_threshold_minutes,
+            working_days = EXCLUDED.working_days
+    """), {
+        "tenant_id": tenant.id,
+        "office_start_time": data.office_start_time,
+        "office_end_time": data.office_end_time,
+        "late_threshold_minutes": data.late_threshold_minutes,
+        "working_days": data.working_days
+    })
+    
+    await db.commit()
+    
+    return {"message": "Settings updated successfully"}
+
+
+@router.get("/profile")
+async def get_tenant_profile(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get own profile"""
+    
+    return {
+        "id": tenant.id,
+        "name": tenant.name,
+        "api_key": tenant.api_key,
+        "created_at": tenant.created_at
+    }
+
+================================================================================
+FILE: api/routes/tenant/employees.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from typing import Optional
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant
+
+router = APIRouter()
+
+
+@router.get("/employees")
+async def list_all_employees(
+    dept_id: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: List all employees across all departments"""
+    
+    query = """
+        SELECT 
+            u.id,
+            u.name,
+            u.employee_code,
+            u.email,
+            u.finger_id,
+            u.is_active,
+            u.created_at,
+            d.department_id,
+            d.department_name
+        FROM users u
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        WHERE u.tenant_id = :tenant_id
+        AND u.role = 'employee'
+    """
+    
+    params = {"tenant_id": tenant.id}
+    
+    if dept_id:
+        query += " AND u.dept_id = :dept_id"
+        params["dept_id"] = dept_id
+    
+    query += " ORDER BY u.name"
+    
+    result = await db.execute(text(query), params)
+    return result.mappings().all()
+
+
+@router.get("/employees/{employee_id}")
+async def get_employee_detail(
+    employee_id: int,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get detailed employee information"""
+    
+    result = await db.execute(text("""
+        SELECT 
+            u.id,
+            u.name,
+            u.employee_code,
+            u.email,
+            u.finger_id,
+            u.is_active,
+            u.created_at,
+            d.department_id,
+            d.department_name,
+            COUNT(a.id) as total_attendance,
+            MAX(a.timestamp) as last_attendance
+        FROM users u
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        LEFT JOIN attendance_logs a ON u.id = a.user_id
+        WHERE u.id = :employee_id
+        AND u.tenant_id = :tenant_id
+        AND u.role = 'employee'
+        GROUP BY u.id, d.department_id
+    """), {
+        "employee_id": employee_id,
+        "tenant_id": tenant.id
+    })
+    
+    employee = result.mappings().first()
+    
+    if not employee:
+        raise HTTPException(404, "Employee not found")
+    
+    return employee
+
+
+@router.get("/employees/{employee_id}/attendance")
+async def get_employee_attendance(
+    employee_id: int,
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: View employee's attendance history"""
+    
+    query = """
+        SELECT 
+            DATE(timestamp) as date,
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
+                THEN 'present' 
+                ELSE 'absent' 
+            END as status
+        FROM attendance_logs
+        WHERE user_id = :employee_id
+        AND tenant_id = :tenant_id
+    """
+    
+    params = {
+        "employee_id": employee_id,
+        "tenant_id": tenant.id
+    }
+    
+    if month and year:
+        query += " AND EXTRACT(MONTH FROM timestamp) = :month AND EXTRACT(YEAR FROM timestamp) = :year"
+        params["month"] = month
+        params["year"] = year
+    
+    query += " GROUP BY DATE(timestamp) ORDER BY date DESC"
+    
+    result = await db.execute(text(query), params)
+    return result.mappings().all()
+
+
+@router.get("/employees/fingerprint/{finger_id}")
+async def find_employee_by_fingerprint(
+    finger_id: int,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Find employee by fingerprint ID"""
+    
+    result = await db.execute(text("""
+        SELECT 
+            u.id,
+            u.name,
+            u.employee_code,
+            u.finger_id,
+            d.department_name
+        FROM users u
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        WHERE u.tenant_id = :tenant_id
+        AND u.finger_id = :finger_id
+        AND u.role = 'employee'
+    """), {
+        "tenant_id": tenant.id,
+        "finger_id": finger_id
+    })
+    
+    employee = result.mappings().first()
+    
+    if not employee:
+        raise HTTPException(404, "No employee found with this fingerprint ID")
+    
+    return employee
+
+================================================================================
+FILE: api/routes/tenant/holidays.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from pydantic import BaseModel
+from datetime import date
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant
+
+router = APIRouter()
+
+
+# =========================
+# SCHEMAS
+# =========================
+
+class HolidayCreate(BaseModel):
+    name: str
+    holiday_date: date
+    description: str = None
+
+
+class HolidayUpdate(BaseModel):
+    name: str
+    holiday_date: date
+    description: str = None
+
+
+# =========================
+# ROUTES
+# =========================
+
+@router.get("/holidays")
+async def list_holidays(
+    year: int = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: List all holidays"""
+    
+    query = """
+        SELECT *
+        FROM holidays
+        WHERE tenant_id = :tenant_id
+    """
+    
+    params = {"tenant_id": tenant.id}
+    
+    if year:
+        query += " AND EXTRACT(YEAR FROM holiday_date) = :year"
+        params["year"] = year
+    
+    query += " ORDER BY holiday_date"
+    
+    result = await db.execute(text(query), params)
+    return result.mappings().all()
+
+
+@router.post("/holidays")
+async def create_holiday(
+    data: HolidayCreate,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Create a new holiday"""
+    
+    await db.execute(text("""
+        INSERT INTO holidays (tenant_id, name, holiday_date, description)
+        VALUES (:tenant_id, :name, :holiday_date, :description)
+    """), {
+        "tenant_id": tenant.id,
+        "name": data.name,
+        "holiday_date": data.holiday_date,
+        "description": data.description
+    })
+    
+    await db.commit()
+    
+    return {"message": "Holiday created successfully"}
+
+
+@router.put("/holidays/{holiday_id}")
+async def update_holiday(
+    holiday_id: int,
+    data: HolidayUpdate,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Update a holiday"""
+    
+    result = await db.execute(text("""
+        UPDATE holidays
+        SET name = :name,
+            holiday_date = :holiday_date,
+            description = :description
+        WHERE holiday_id = :holiday_id
+        AND tenant_id = :tenant_id
+    """), {
+        "holiday_id": holiday_id,
+        "tenant_id": tenant.id,
+        "name": data.name,
+        "holiday_date": data.holiday_date,
+        "description": data.description
+    })
+    
+    if result.rowcount == 0:
+        raise HTTPException(404, "Holiday not found")
+    
+    await db.commit()
+    
+    return {"message": "Holiday updated successfully"}
+
+
+@router.delete("/holidays/{holiday_id}")
+async def delete_holiday(
+    holiday_id: int,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Delete a holiday"""
+    
+    result = await db.execute(text("""
+        DELETE FROM holidays
+        WHERE holiday_id = :holiday_id
+        AND tenant_id = :tenant_id
+    """), {
+        "holiday_id": holiday_id,
+        "tenant_id": tenant.id
+    })
+    
+    if result.rowcount == 0:
+        raise HTTPException(404, "Holiday not found")
+    
+    await db.commit()
+    
+    return {"message": "Holiday deleted successfully"}
+
+
+@router.get("/holidays/upcoming")
+async def upcoming_holidays(
+    limit: int = 5,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get upcoming holidays"""
+    
+    result = await db.execute(text("""
+        SELECT *
+        FROM holidays
+        WHERE tenant_id = :tenant_id
+        AND holiday_date >= CURRENT_DATE
+        ORDER BY holiday_date
+        LIMIT :limit
+    """), {
+        "tenant_id": tenant.id,
+        "limit": limit
+    })
+    
+    return result.mappings().all()
+
+================================================================================
+FILE: api/routes/tenant/devices.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import text
+from pydantic import BaseModel
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant, Device, Command
+from app.mqtt.client import mqtt_manager
+
+router = APIRouter()
+
+
+class FireCommandRequest(BaseModel):
+    device_id: str
+    command: str
+    target_id: int = None
+
+
+@router.get("/devices")
+async def list_devices(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: List all devices in organization"""
+    
+    result = await db.execute(
+        select(Device).where(Device.tenant_id == tenant.id).order_by(Device.device_id)
+    )
+    devices = result.scalars().all()
+    
+    return [
+        {
+            "device_id": d.device_id,
+            "status": d.status,
+            "last_seen": d.last_seen
+        }
+        for d in devices
+    ]
+
+
+@router.get("/devices/{device_id}")
+async def get_device(
+    device_id: str,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get device details"""
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == device_id,
+            Device.tenant_id == tenant.id
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(404, "Device not found")
+    
+    commands = await db.execute(text("""
+        SELECT id, command, target_id, status, created_at
+        FROM commands
+        WHERE device_id = :device_id
+        AND tenant_id = :tenant_id
+        ORDER BY created_at DESC
+        LIMIT 20
+    """), {
+        "device_id": device_id,
+        "tenant_id": tenant.id
+    })
+    
+    return {
+        "device_id": device.device_id,
+        "status": device.status,
+        "last_seen": device.last_seen,
+        "recent_commands": commands.mappings().all()
+    }
+
+
+@router.get("/devices/status")
+async def devices_status(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Get devices status summary"""
+    
+    result = await db.execute(text("""
+        SELECT 
+            COUNT(*) as total,
+            COUNT(*) FILTER (WHERE status = 'online') as online,
+            COUNT(*) FILTER (WHERE status != 'online') as offline
+        FROM devices
+        WHERE tenant_id = :tenant_id
+    """), {"tenant_id": tenant.id})
+    
+    return result.mappings().first()
+
+
+@router.post("/devices/fire-command")
+async def fire_device_command(
+    data: FireCommandRequest,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Send command to device"""
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == data.device_id,
+            Device.tenant_id == tenant.id
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(404, "Device not found")
+    
+    cmd = Command(
+        tenant_id=tenant.id,
+        device_id=data.device_id,
+        command=data.command,
+        target_id=data.target_id
+    )
+    
+    db.add(cmd)
+    await db.commit()
+    await db.refresh(cmd)
+    
+    mqtt_manager.publish_command(
+        tenant.id,
+        data.device_id,
+        cmd.id,
+        data.command,
+        data.target_id
+    )
+    
+    return {
+        "message": "Command dispatched",
+        "command_id": cmd.id
+    }
+
+================================================================================
+FILE: api/routes/tenant/departments.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import text
+from pydantic import BaseModel
+from app.db.session import get_db
+from app.api.dependencies import verify_tenant_api_key
+from app.models.domain import Tenant, Department, User
+
+router = APIRouter()
+
+
+# =========================
+# SCHEMAS
+# =========================
+
+class DepartmentCreate(BaseModel):
+    department_name: str
+
+
+class DepartmentUpdate(BaseModel):
+    department_name: str
+
+
+# =========================
+# ROUTES
+# =========================
+
+@router.get("/departments")
+async def list_departments(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: List all departments with stats"""
+    
+    result = await db.execute(text("""
+        SELECT 
+            d.department_id,
+            d.department_name,
+            d.is_active,
+            d.created_at,
+            COUNT(u.id) FILTER (WHERE u.role = 'org_admin') as org_admin_count,
+            COUNT(u.id) FILTER (WHERE u.role = 'employee' AND u.is_active = true) as employee_count
+        FROM departments d
+        LEFT JOIN users u ON d.department_id = u.dept_id
+        WHERE d.tenant_id = :tenant_id
+        GROUP BY d.department_id
+        ORDER BY d.department_name
+    """), {"tenant_id": tenant.id})
+    
+    return result.mappings().all()
+
+
+@router.post("/departments")
+async def create_department(
+    data: DepartmentCreate,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Create a new department"""
+    
+    existing = await db.execute(
+        select(Department).where(
+            Department.tenant_id == tenant.id,
+            Department.department_name == data.department_name
+        )
+    )
+    if existing.scalars().first():
+        raise HTTPException(400, "Department already exists")
+    
+    department = Department(
+        tenant_id=tenant.id,
+        department_name=data.department_name,
+        is_active=True
+    )
+    
+    db.add(department)
+    await db.commit()
+    await db.refresh(department)
+    
+    return {
+        "message": "Department created successfully",
+        "department": {
+            "department_id": department.department_id,
+            "department_name": department.department_name
+        }
+    }
+
+
+@router.put("/departments/{department_id}")
+async def update_department(
+    department_id: int,
+    data: DepartmentUpdate,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Update department"""
+    
+    result = await db.execute(
+        select(Department).where(
+            Department.department_id == department_id,
+            Department.tenant_id == tenant.id
+        )
+    )
+    department = result.scalars().first()
+    
+    if not department:
+        raise HTTPException(404, "Department not found")
+    
+    department.department_name = data.department_name
+    await db.commit()
+    
+    return {"message": "Department updated successfully"}
+
+
+@router.delete("/departments/{department_id}")
+async def delete_department(
+    department_id: int,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Delete department (only if empty)"""
+    
+    # Check if department has users
+    user_result = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant.id,
+            User.dept_id == department_id
+        )
+    )
+    if user_result.scalars().first():
+        raise HTTPException(400, "Cannot delete department with existing users")
+    
+    result = await db.execute(
+        select(Department).where(
+            Department.department_id == department_id,
+            Department.tenant_id == tenant.id
+        )
+    )
+    department = result.scalars().first()
+    
+    if not department:
+        raise HTTPException(404, "Department not found")
+    
+    await db.delete(department)
+    await db.commit()
+    
+    return {"message": "Department deleted permanently"}
+
+================================================================================
+FILE: api/routes/super_admin/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: api/routes/super_admin/tenants.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from pydantic import BaseModel
+import secrets
+
+from app.db.session import get_db
+from app.api.dependencies import require_super_admin
+from app.models.domain import User, Tenant
+
+router = APIRouter()
+
+
+# =========================
+# SCHEMAS
+# =========================
+
+class TenantCreate(BaseModel):
+    """Creating a tenant = Creating manager login credentials"""
+    organization_name: str
+    manager_email: str
+    manager_password: str
+
+
+# =========================
+# ROUTES
+# =========================
+
+@router.get("/tenants")
+async def list_tenants(
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Super Admin: List all tenants (organizations)"""
+    
+    result = await db.execute(select(Tenant).order_by(Tenant.name))
+    tenants = result.scalars().all()
+    
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "api_key": t.api_key,
+            "created_at": t.created_at
+        }
+        for t in tenants
+    ]
+
+
+@router.post("/tenants")
+async def create_tenant(
+    data: TenantCreate,
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Super Admin: Create a new tenant (organization).
+    The api_key serves as the manager's authentication token.
+    """
+    
+    # Check if organization name exists
+    existing = await db.execute(
+        select(Tenant).where(Tenant.name == data.organization_name)
+    )
+    if existing.scalars().first():
+        raise HTTPException(400, "Organization name already exists")
+    
+    # Generate API key (this is the manager's credential)
+    api_key = secrets.token_hex(16)
+    
+    tenant = Tenant(
+        name=data.organization_name,
+        api_key=api_key
+    )
+    
+    db.add(tenant)
+    await db.commit()
+    await db.refresh(tenant)
+    
+    return {
+        "message": "Tenant created successfully",
+        "tenant": {
+            "id": tenant.id,
+            "name": tenant.name,
+            "api_key": tenant.api_key
+        }
+    }
+
+
+@router.get("/tenants/{tenant_id}")
+async def get_tenant(
+    tenant_id: int,
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Super Admin: Get tenant details"""
+    
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant = result.scalars().first()
+    
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    # Get stats for this tenant
+    from sqlalchemy import text
+    stats = await db.execute(text("""
+        SELECT 
+            COUNT(DISTINCT d.department_id) as department_count,
+            COUNT(DISTINCT u.id) FILTER (WHERE u.role = 'org_admin') as org_admin_count,
+            COUNT(DISTINCT u.id) FILTER (WHERE u.role = 'employee') as employee_count
+        FROM tenants t
+        LEFT JOIN departments d ON t.id = d.tenant_id
+        LEFT JOIN users u ON t.id = u.tenant_id
+        WHERE t.id = :tenant_id
+        GROUP BY t.id
+    """), {"tenant_id": tenant_id})
+    
+    stats_data = stats.mappings().first()
+    
+    return {
+        "id": tenant.id,
+        "name": tenant.name,
+        "api_key": tenant.api_key,
+        "created_at": tenant.created_at,
+        "stats": {
+            "departments": stats_data["department_count"] if stats_data else 0,
+            "org_admins": stats_data["org_admin_count"] if stats_data else 0,
+            "employees": stats_data["employee_count"] if stats_data else 0
+        }
+    }
+
+
+@router.patch("/tenants/{tenant_id}/reset-api-key")
+async def reset_tenant_api_key(
+    tenant_id: int,
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Super Admin: Reset manager's API key"""
+    
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant = result.scalars().first()
+    
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    # Generate new API key
+    new_api_key = secrets.token_hex(16)
+    tenant.api_key = new_api_key
+    await db.commit()
+    
+    return {
+        "message": "API key reset successfully",
+        "new_api_key": new_api_key
+    }
+
+
+@router.delete("/tenants/{tenant_id}")
+async def delete_tenant(
+    tenant_id: int,
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Super Admin: Delete a tenant"""
+    
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant = result.scalars().first()
+    
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    await db.delete(tenant)
+    await db.commit()
+    
+    return {"message": "Tenant deleted successfully"}
+
+================================================================================
+FILE: api/routes/employee/attendance.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from datetime import datetime, date
+from app.db.session import get_db
+from app.api.dependencies import get_current_user
+from app.models.domain import User
+
+router = APIRouter()
+
+
+# =========================
+# SPECIFIC ROUTES FIRST!
+# =========================
+
+@router.get("/attendance/today")
+async def get_today_attendance(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get today's attendance status"""
+    query = text("""
+        SELECT
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
+                THEN 'present' 
+                ELSE 'absent' 
+            END as status,
+            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked
+        FROM attendance_logs
+        WHERE user_id = :user_id
+        AND DATE(timestamp) = CURRENT_DATE
+    """)
+    result = await db.execute(query, {"user_id": current_user.id})
+    data = result.mappings().first()
+    
+    if not data or not data["check_in"]:
+        return {
+            "check_in": None,
+            "check_out": None,
+            "status": "absent",
+            "hours_worked": 0
+        }
+    
+    return {
+        "check_in": data["check_in"],
+        "check_out": data["check_out"],
+        "status": data["status"],
+        "hours_worked": round(data["hours_worked"] or 0, 2)
+    }
+
+
+@router.get("/attendance/stats")
+async def get_attendance_stats(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get overall attendance statistics"""
+    
+    # Get daily aggregates
+    daily_query = text("""
+        SELECT
+            DATE(timestamp) as work_date,
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00' THEN 1 ELSE 0
+            END as is_late,
+            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked
+        FROM attendance_logs
+        WHERE user_id = :user_id
+        AND record_type IN ('IN', 'OUT')
+        GROUP BY DATE(timestamp)
+        HAVING MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
+    """)
+    
+    daily_result = await db.execute(daily_query, {"user_id": current_user.id})
+    daily_rows = daily_result.mappings().all()
+    
+    # Get first and last punch
+    punch_query = text("""
+        SELECT
+            MIN(timestamp) as first_punch,
+            MAX(timestamp) as last_punch
+        FROM attendance_logs
+        WHERE user_id = :user_id
+    """)
+    punch_result = await db.execute(punch_query, {"user_id": current_user.id})
+    punch_data = punch_result.mappings().first()
+    
+    total_present = len(daily_rows)
+    total_late = sum(r["is_late"] or 0 for r in daily_rows)
+    total_hours = sum(r["hours_worked"] or 0 for r in daily_rows)
+    
+    return {
+        "total_present_days": total_present,
+        "total_late_days": total_late,
+        "total_hours_worked": round(total_hours, 2),
+        "average_hours_per_day": round(total_hours / max(1, total_present), 2),
+        "first_punch": punch_data["first_punch"] if punch_data else None,
+        "last_punch": punch_data["last_punch"] if punch_data else None
+    }
+
+
+@router.get("/attendance/stats/monthly")
+async def get_monthly_stats(
+    month: int = None,
+    year: int = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get monthly attendance statistics"""
+    from calendar import monthrange
+    
+    if not month:
+        month = datetime.now().month
+    if not year:
+        year = datetime.now().year
+    
+    # Get daily aggregates for the month
+    daily_query = text("""
+        SELECT
+            DATE(timestamp) as work_date,
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL THEN 1 ELSE 0
+            END as is_present,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00' THEN 1 ELSE 0
+            END as is_late,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time <= '09:15:00' THEN 1 ELSE 0
+            END as is_on_time,
+            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked
+        FROM attendance_logs
+        WHERE user_id = :user_id
+        AND EXTRACT(MONTH FROM timestamp) = :month
+        AND EXTRACT(YEAR FROM timestamp) = :year
+        AND record_type IN ('IN', 'OUT')
+        GROUP BY DATE(timestamp)
+        HAVING MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
+        ORDER BY work_date
+    """)
+    
+    daily_result = await db.execute(daily_query, {
+        "user_id": current_user.id,
+        "month": month,
+        "year": year
+    })
+    daily_rows = daily_result.mappings().all()
+    
+    # Calculate aggregates
+    present = len(daily_rows)
+    late = sum(1 for r in daily_rows if r["is_late"])
+    on_time = sum(1 for r in daily_rows if r["is_on_time"])
+    total_hours = sum(r["hours_worked"] or 0 for r in daily_rows)
+    
+    _, total_days = monthrange(year, month)
+    working_days = total_days - (total_days // 7 * 2)  # Simplified: exclude weekends
+    
+    # Overtime calculation (assuming 9 hours standard)
+    overtime_hours = sum(max(0, (r["hours_worked"] or 0) - 9) for r in daily_rows)
+    
+    return {
+        "month": month,
+        "year": year,
+        "total_days_in_month": total_days,
+        "estimated_working_days": working_days,
+        "present_days": present,
+        "absent_days": max(0, working_days - present),
+        "late_days": late,
+        "on_time_days": on_time,
+        "total_hours": round(total_hours, 2),
+        "average_hours_per_day": round(total_hours / max(1, present), 2),
+        "overtime_hours": round(overtime_hours, 2),
+        "attendance_percentage": round((present / max(1, working_days)) * 100, 2)
+    }
+
+
+@router.get("/attendance/hours/summary")
+async def get_hours_summary(
+    month: int = None,
+    year: int = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get detailed hours worked summary"""
+    if not month:
+        month = datetime.now().month
+    if not year:
+        year = datetime.now().year
+    
+    query = text("""
+        SELECT
+            DATE(timestamp) as work_date,
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
+            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked,
+            CASE 
+                WHEN EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 > 9 
+                THEN EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 - 9
+                ELSE 0
+            END as overtime_hours,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
+                THEN 'late'
+                ELSE 'on_time'
+            END as punctuality
+        FROM attendance_logs
+        WHERE user_id = :user_id
+        AND EXTRACT(MONTH FROM timestamp) = :month
+        AND EXTRACT(YEAR FROM timestamp) = :year
+        AND record_type IN ('IN', 'OUT')
+        GROUP BY DATE(timestamp)
+        HAVING MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
+        ORDER BY work_date DESC
+    """)
+    
+    result = await db.execute(query, {
+        "user_id": current_user.id,
+        "month": month,
+        "year": year
+    })
+    rows = result.mappings().all()
+    
+    total_hours = sum(r["hours_worked"] or 0 for r in rows)
+    total_overtime = sum(r["overtime_hours"] or 0 for r in rows)
+    
+    return {
+        "month": month,
+        "year": year,
+        "daily_breakdown": [
+            {
+                "date": str(r["work_date"]),
+                "check_in": str(r["check_in"]) if r["check_in"] else None,
+                "check_out": str(r["check_out"]) if r["check_out"] else None,
+                "hours_worked": round(r["hours_worked"] or 0, 2),
+                "overtime": round(r["overtime_hours"] or 0, 2),
+                "punctuality": r["punctuality"]
+            }
+            for r in rows
+        ],
+        "summary": {
+            "total_days_worked": len(rows),
+            "total_hours": round(total_hours, 2),
+            "total_overtime": round(total_overtime, 2),
+            "average_hours": round(total_hours / max(1, len(rows)), 2)
+        }
+    }
+
+
+@router.get("/attendance/calendar")
+async def get_attendance_calendar(
+    month: int = None,
+    year: int = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get calendar-style attendance view"""
+    if not month:
+        month = datetime.now().month
+    if not year:
+        year = datetime.now().year
+    
+    query = text("""
+        SELECT
+            EXTRACT(DAY FROM DATE(timestamp)) as day_num,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
+                THEN 'present' 
+                ELSE 'absent' 
+            END as status,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
+                THEN 'late'
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
+                THEN 'on_time'
+                ELSE NULL
+            END as punctuality
+        FROM attendance_logs
+        WHERE user_id = :user_id
+        AND EXTRACT(MONTH FROM timestamp) = :month
+        AND EXTRACT(YEAR FROM timestamp) = :year
+        GROUP BY DATE(timestamp)
+        ORDER BY day_num
+    """)
+    
+    result = await db.execute(query, {
+        "user_id": current_user.id,
+        "month": month,
+        "year": year
+    })
+    rows = result.mappings().all()
+    
+    from calendar import monthrange
+    _, total_days = monthrange(year, month)
+    
+    calendar_data = {}
+    for row in rows:
+        day = int(row["day_num"])
+        calendar_data[day] = {
+            "status": row["status"],
+            "punctuality": row["punctuality"]
+        }
+    
+    # Fill missing days as absent or weekend
+    for day in range(1, total_days + 1):
+        if day not in calendar_data:
+            # Check if weekend (Saturday=5, Sunday=6 in Python's weekday)
+            import datetime as dt
+            weekday = dt.date(year, month, day).weekday()
+            is_weekend = weekday >= 5
+            calendar_data[day] = {
+                "status": "weekend" if is_weekend else "absent",
+                "punctuality": None
+            }
+    
+    return {
+        "month": month,
+        "year": year,
+        "total_days": total_days,
+        "calendar": calendar_data
+    }
+
+
+# =========================
+# GENERIC ROUTES LAST!
+# =========================
+
+@router.get("/attendance")
+async def get_attendance(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get personal attendance history"""
+    query = text("""
+        SELECT
+            DATE(timestamp) as attendance_date,
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
+            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
+                THEN 'present' ELSE 'absent' 
+            END as status,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
+                THEN 'late'
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
+                THEN 'on_time'
+                ELSE NULL
+            END as punctuality
+        FROM attendance_logs
+        WHERE user_id = :user_id
+        GROUP BY DATE(timestamp)
+        ORDER BY attendance_date DESC
+        LIMIT 90
+    """)
+    result = await db.execute(query, {"user_id": current_user.id})
+    rows = result.mappings().all()
+    
+    return [
+        {
+            "date": str(r["attendance_date"]),
+            "check_in": str(r["check_in"]) if r["check_in"] else None,
+            "check_out": str(r["check_out"]) if r["check_out"] else None,
+            "hours_worked": round(r["hours_worked"] or 0, 2),
+            "status": r["status"],
+            "punctuality": r["punctuality"]
+        }
+        for r in rows
+    ]
+
+
+@router.get("/attendance/{date_str}")
+async def get_attendance_by_date(
+    date_str: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get attendance for a specific date (YYYY-MM-DD)"""
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
+    
+    query = text("""
+        SELECT
+            DATE(timestamp) as attendance_date,
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
+            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
+                THEN 'present' ELSE 'absent' 
+            END as status,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
+                THEN 'late'
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
+                THEN 'on_time'
+                ELSE NULL
+            END as punctuality
+        FROM attendance_logs
+        WHERE user_id = :user_id AND DATE(timestamp) = :target_date
+        GROUP BY DATE(timestamp)
+    """)
+    result = await db.execute(query, {
+        "user_id": current_user.id,
+        "target_date": target_date
+    })
+    data = result.mappings().first()
+    
+    if not data or not data["check_in"]:
+        return {
+            "attendance_date": date_str,
+            "check_in": None,
+            "check_out": None,
+            "hours_worked": 0,
+            "status": "absent",
+            "punctuality": None
+        }
+    
+    return {
+        "attendance_date": str(data["attendance_date"]),
+        "check_in": str(data["check_in"]) if data["check_in"] else None,
+        "check_out": str(data["check_out"]) if data["check_out"] else None,
+        "hours_worked": round(data["hours_worked"] or 0, 2),
+        "status": data["status"],
+        "punctuality": data["punctuality"]
+    }
+
+
+@router.get("/attendance/export")
+async def export_attendance(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Export attendance data as CSV-ready format"""
+    query = text("""
+        SELECT
+            TO_CHAR(DATE(timestamp), 'YYYY-MM-DD') as date,
+            TO_CHAR(MIN(timestamp) FILTER (WHERE record_type = 'IN'), 'HH24:MI:SS') as check_in,
+            TO_CHAR(MAX(timestamp) FILTER (WHERE record_type = 'OUT'), 'HH24:MI:SS') as check_out,
+            ROUND(EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600, 2) as hours_worked,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
+                THEN 'Present' ELSE 'Absent' 
+            END as status,
+            CASE 
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
+                THEN 'Late'
+                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
+                THEN 'On Time'
+                ELSE '-'
+            END as punctuality
+        FROM attendance_logs
+        WHERE user_id = :user_id
+        GROUP BY DATE(timestamp)
+        ORDER BY date DESC
+    """)
+    result = await db.execute(query, {"user_id": current_user.id})
+    rows = result.mappings().all()
+    
+    return {
+        "message": "Export ready",
+        "format": "csv",
+        "total_records": len(rows),
+        "data": [dict(r) for r in rows]
+    }
+
+================================================================================
+FILE: api/routes/employee/profile.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from pydantic import BaseModel
+from app.db.session import get_db
+from app.api.dependencies import get_current_user
+from app.models.domain import User
+from app.core.security import verify_password, hash_password
+
+router = APIRouter()
+
+
+# =========================
+# SCHEMAS
+# =========================
+
+class ProfileUpdate(BaseModel):
+    name: str | None = None
+    email: str | None = None
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+
+# =========================
+# ROUTES
+# =========================
+
+@router.get("/profile")
+async def get_profile(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get own profile"""
+    
+    result = await db.execute(text("""
+        SELECT
+            u.id,
+            u.name,
+            u.email,
+            u.employee_code,
+            u.finger_id,
+            u.role,
+            u.is_active,
+            u.created_at,
+            d.department_id,
+            d.department_name
+        FROM users u
+        LEFT JOIN departments d ON d.department_id = u.dept_id
+        WHERE u.id = :id
+    """), {"id": current_user.id})
+    
+    profile = result.mappings().first()
+    
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    
+    return profile
+
+
+@router.put("/profile")
+async def update_profile(
+    data: ProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Update own profile"""
+    
+    if data.name is not None:
+        current_user.name = data.name
+    
+    if data.email is not None:
+        # Check if email is already taken
+        from sqlalchemy.future import select
+        existing = await db.execute(
+            select(User).where(User.email == data.email, User.id != current_user.id)
+        )
+        if existing.scalars().first():
+            raise HTTPException(400, "Email already in use")
+        current_user.email = data.email
+    
+    await db.commit()
+    await db.refresh(current_user)
+    
+    return {
+        "message": "Profile updated successfully",
+        "profile": {
+            "id": current_user.id,
+            "name": current_user.name,
+            "email": current_user.email,
+            "employee_code": current_user.employee_code
+        }
+    }
+
+
+@router.put("/profile/change-password")
+async def change_password(
+    data: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Change own password"""
+    
+    if not current_user.password_hash:
+        raise HTTPException(400, "No password set for this account")
+    
+    if not verify_password(data.old_password, current_user.password_hash):
+        raise HTTPException(401, "Incorrect current password")
+    
+    current_user.password_hash = hash_password(data.new_password)
+    await db.commit()
+    
+    return {"message": "Password updated successfully"}
+
+
+@router.get("/profile/attendance-summary")
+async def attendance_summary(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get personal attendance summary"""
+    
+    result = await db.execute(text("""
+        SELECT
+            COUNT(DISTINCT DATE(timestamp)) FILTER (
+                WHERE DATE_TRUNC('month', timestamp) = DATE_TRUNC('month', CURRENT_DATE)
+                AND record_type = 'IN'
+            ) as present_days_this_month,
+            MIN(timestamp) FILTER (WHERE DATE(timestamp) = CURRENT_DATE AND record_type = 'IN') as today_check_in,
+            MAX(timestamp) FILTER (WHERE DATE(timestamp) = CURRENT_DATE AND record_type = 'OUT') as today_check_out
+        FROM attendance_logs
+        WHERE user_id = :user_id
+    """), {"user_id": current_user.id})
+    
+    data = result.mappings().first()
+    
+    return {
+        "today": {
+            "check_in": data["today_check_in"],
+            "check_out": data["today_check_out"]
+        },
+        "this_month": {
+            "present_days": data["present_days_this_month"] or 0
+        }
+    }
+
+================================================================================
+FILE: api/routes/employee/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: api/routes/employee/dashboard.py
+================================================================================
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from app.db.session import get_db
+from app.api.dependencies import get_current_user
+from app.models.domain import User
+
+router = APIRouter()
+
+
+@router.get("/dashboard")
+async def get_dashboard(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get personal dashboard with today's attendance and monthly summary"""
+    
+    query = text("""
+        SELECT
+            MIN(timestamp) FILTER (WHERE DATE(timestamp) = CURRENT_DATE) as check_in,
+            MAX(timestamp) FILTER (WHERE DATE(timestamp) = CURRENT_DATE) as check_out,
+            COUNT(DISTINCT DATE(timestamp)) FILTER (
+                WHERE DATE_TRUNC('month', timestamp) = DATE_TRUNC('month', CURRENT_DATE)
+                AND record_type = 'IN'
+            ) as present_days
+        FROM attendance_logs
+        WHERE user_id = :user_id
+    """)
+    
+    result = await db.execute(query, {"user_id": current_user.id})
+    data = result.mappings().first()
+    
+    return {
+        "check_in": data["check_in"],
+        "check_out": data["check_out"],
+        "present_days": data["present_days"] or 0
+    }
+
+================================================================================
+FILE: api/routes/employee/leaves.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text, insert
+from pydantic import BaseModel
+from datetime import date
+from typing import Optional
+from app.db.session import get_db
+from app.api.dependencies import get_current_user
+from app.models.domain import User, Notification
+
+router = APIRouter()
+
+
+class LeaveApplyRequest(BaseModel):
+    leave_type: str
+    start_date: date
+    end_date: date
+    reason: Optional[str] = None
+
+
+async def create_leave_notifications_bg(
+    tenant_id: int,
+    employee_id: int,
+    employee_name: str,
+    dept_id: int,
+    leave_type: str,
+    start_date: date,
+    end_date: date,
+    db: AsyncSession
+):
+    """Background task: Create all leave notifications"""
+    
+    # Get org admin IDs
+    org_admins = await db.execute(text("""
+        SELECT id FROM users
+        WHERE tenant_id = :tenant_id
+        AND dept_id = :dept_id
+        AND role = 'org_admin'
+        AND is_active = true
+    """), {
+        "tenant_id": tenant_id,
+        "dept_id": dept_id
+    })
+    admin_ids = [row[0] for row in org_admins.all()]
+    
+    notification_values = []
+    
+    # Org admin notifications
+    for admin_id in admin_ids:
+        notification_values.append({
+            "tenant_id": tenant_id,
+            "actor_id": employee_id,
+            "actor_name": employee_name,
+            "recipient_id": admin_id,
+            "event_type": "leave_requested",
+            "entity_type": "Leave",
+            "entity_name": f"{employee_name} ({leave_type})",
+            "title": "New Leave Request",
+            "message": f"{employee_name} requested {leave_type} leave from {start_date} to {end_date}",
+            "is_read": False
+        })
+    
+    # Employee confirmation
+    notification_values.append({
+        "tenant_id": tenant_id,
+        "actor_id": employee_id,
+        "actor_name": employee_name,
+        "recipient_id": employee_id,
+        "event_type": "leave_submitted",
+        "entity_type": "Leave",
+        "entity_name": f"{leave_type} leave",
+        "title": "Leave Request Submitted",
+        "message": f"Your {leave_type} leave request from {start_date} to {end_date} has been submitted",
+        "is_read": False
+    })
+    
+    if notification_values:
+        await db.execute(insert(Notification).values(notification_values))
+        await db.commit()
+
+
+# =========================
+# SPECIFIC ROUTES FIRST
+# =========================
+
+@router.get("/leaves/balance")
+async def leave_balance(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get leave balance"""
+    result = await db.execute(text("""
+        SELECT 
+            COUNT(*) FILTER (WHERE leave_type = 'sick' AND status IN ('approved', 'approved_by_dept')) as sick_taken,
+            COUNT(*) FILTER (WHERE leave_type = 'casual' AND status IN ('approved', 'approved_by_dept')) as casual_taken,
+            COUNT(*) FILTER (WHERE leave_type = 'earned' AND status IN ('approved', 'approved_by_dept')) as earned_taken
+        FROM leaves
+        WHERE employee_id = :user_id
+        AND EXTRACT(YEAR FROM start_date) = EXTRACT(YEAR FROM CURRENT_DATE)
+    """), {"user_id": current_user.id})
+    
+    taken = result.mappings().first()
+    
+    return {
+        "sick": {"total": 12, "taken": taken["sick_taken"] or 0, "remaining": 12 - (taken["sick_taken"] or 0)},
+        "casual": {"total": 12, "taken": taken["casual_taken"] or 0, "remaining": 12 - (taken["casual_taken"] or 0)},
+        "earned": {"total": 15, "taken": taken["earned_taken"] or 0, "remaining": 15 - (taken["earned_taken"] or 0)}
+    }
+
+
+@router.get("/leaves/stats")
+async def leave_stats(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get leave statistics"""
+    result = await db.execute(text("""
+        SELECT
+            COUNT(*) as total,
+            COUNT(*) FILTER (WHERE status = 'pending') as pending,
+            COUNT(*) FILTER (WHERE status = 'approved_by_dept') as dept_approved,
+            COUNT(*) FILTER (WHERE status = 'approved') as approved,
+            COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
+            COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
+        FROM leaves
+        WHERE employee_id = :user_id
+    """), {"user_id": current_user.id})
+    
+    stats = result.mappings().first()
+    
+    return {
+        "total": stats["total"] or 0,
+        "pending": stats["pending"] or 0,
+        "dept_approved": stats["dept_approved"] or 0,
+        "approved": stats["approved"] or 0,
+        "rejected": stats["rejected"] or 0,
+        "cancelled": stats["cancelled"] or 0
+    }
+
+
+# =========================
+# GENERIC ROUTES LAST
+# =========================
+
+@router.get("/leaves")
+async def get_leaves(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get own leave requests"""
+    result = await db.execute(text("""
+        SELECT *
+        FROM leaves
+        WHERE employee_id = :user_id
+        ORDER BY created_at DESC
+    """), {"user_id": current_user.id})
+    return result.mappings().all()
+
+
+@router.post("/leaves")
+async def apply_leave(
+    data: LeaveApplyRequest,
+    background_tasks: BackgroundTasks,  # ← ADDED
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Apply for leave - FAST with background tasks"""
+    
+    # 1. Check overlapping leaves
+    overlap = await db.execute(text("""
+        SELECT leave_id FROM leaves
+        WHERE employee_id = :user_id
+        AND status NOT IN ('rejected', 'cancelled')
+        AND (
+            (:start_date BETWEEN start_date AND end_date)
+            OR (:end_date BETWEEN start_date AND end_date)
+            OR (start_date BETWEEN :start_date AND :end_date)
+        )
+    """), {
+        "user_id": current_user.id,
+        "start_date": data.start_date,
+        "end_date": data.end_date
+    })
+    
+    if overlap.scalar():
+        raise HTTPException(400, "Leave request overlaps with existing leave")
+    
+    # 2. Insert leave (SYNCHRONOUS - must happen before response)
+    await db.execute(text("""
+        INSERT INTO leaves (tenant_id, employee_id, leave_type, start_date, end_date, reason, status)
+        VALUES (:tenant_id, :employee_id, :leave_type, :start_date, :end_date, :reason, 'pending')
+    """), {
+        "tenant_id": current_user.tenant_id,
+        "employee_id": current_user.id,
+        "leave_type": data.leave_type,
+        "start_date": data.start_date,
+        "end_date": data.end_date,
+        "reason": data.reason
+    })
+    await db.commit()
+    
+    # 3. Schedule notifications in BACKGROUND
+    background_tasks.add_task(
+        create_leave_notifications_bg,
+        tenant_id=current_user.tenant_id,
+        employee_id=current_user.id,
+        employee_name=current_user.name,
+        dept_id=current_user.dept_id,
+        leave_type=data.leave_type,
+        start_date=data.start_date,
+        end_date=data.end_date,
+        db=db
+    )
+    
+    # 4. Return IMMEDIATELY - user doesn't wait for notifications!
+    return {"message": "Leave applied successfully"}
+
+
+@router.get("/leaves/{leave_id}")
+async def leave_detail(
+    leave_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get specific leave request"""
+    result = await db.execute(text("""
+        SELECT * FROM leaves
+        WHERE leave_id = :leave_id AND employee_id = :user_id
+    """), {"leave_id": leave_id, "user_id": current_user.id})
+    
+    leave = result.mappings().first()
+    if not leave:
+        raise HTTPException(404, "Leave request not found")
+    return leave
+
+
+@router.patch("/leaves/{leave_id}/cancel")
+async def cancel_leave(
+    leave_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Cancel leave request"""
+    
+    leave_info = await db.execute(text("""
+        SELECT leave_type, start_date, end_date FROM leaves
+        WHERE leave_id = :leave_id AND employee_id = :user_id
+    """), {"leave_id": leave_id, "user_id": current_user.id})
+    info = leave_info.mappings().first()
+    
+    if not info:
+        raise HTTPException(404, "Leave request not found")
+    
+    result = await db.execute(text("""
+        UPDATE leaves SET status = 'cancelled'
+        WHERE leave_id = :leave_id AND employee_id = :user_id AND status = 'pending'
+    """), {"leave_id": leave_id, "user_id": current_user.id})
+    
+    if result.rowcount == 0:
+        raise HTTPException(404, "Leave request not found or cannot be cancelled")
+    
+    await db.commit()
+    
+    return {"message": "Leave cancelled"}
+
+================================================================================
+FILE: api/routes/employee/notifications.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import func, update
+from datetime import datetime
+from app.db.session import get_db
+from app.api.dependencies import get_current_user
+from app.models.domain import User, Notification
+
+router = APIRouter()
+
+
+@router.get("/notifications/unread-count")
+async def unread_count(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get count of unread notifications for current user"""
+    result = await db.execute(
+        select(func.count())
+        .select_from(Notification)
+        .where(
+            Notification.recipient_id == current_user.id,
+            Notification.is_read == False,
+            Notification.tenant_id == current_user.tenant_id
+        )
+    )
+    
+    return {"count": result.scalar() or 0}
+
+
+@router.patch("/notifications/read-all")
+async def mark_all_read(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Mark all notifications as read for current user"""
+    await db.execute(
+        update(Notification)
+        .where(
+            Notification.recipient_id == current_user.id,
+            Notification.tenant_id == current_user.tenant_id
+        )
+        .values(is_read=True, read_at=datetime.utcnow())
+    )
+    await db.commit()
+    return {"message": "All notifications marked as read"}
+
+
+@router.patch("/notifications/{notification_id}/read")
+async def mark_read(
+    notification_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Mark a single notification as read (only affects current user's copy)"""
+    result = await db.execute(
+        update(Notification)
+        .where(
+            Notification.notification_id == notification_id,
+            Notification.recipient_id == current_user.id
+        )
+        .values(is_read=True, read_at=datetime.utcnow())
+    )
+    
+    if result.rowcount == 0:
+        raise HTTPException(404, "Notification not found")
+    
+    await db.commit()
+    return {"message": "Notification marked as read"}
+
+
+@router.get("/notifications")
+async def get_notifications(
+    limit: int = 50,
+    unread_only: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all notifications for current user"""
+    
+    query = select(Notification).where(
+        Notification.recipient_id == current_user.id,
+        Notification.tenant_id == current_user.tenant_id
+    )
+    
+    if unread_only:
+        query = query.where(Notification.is_read == False)
+    
+    query = query.order_by(Notification.created_at.desc()).limit(limit)
+    
+    result = await db.execute(query)
+    notifications = result.scalars().all()
+    
+    return [
+        {
+            "notification_id": n.notification_id,
+            "actor_name": n.actor_name,
+            "event_type": n.event_type,
+            "entity_type": n.entity_type,
+            "entity_name": n.entity_name,
+            "title": n.title,
+            "message": n.message,
+            "is_read": n.is_read,
+            "read_at": n.read_at,
+            "created_at": n.created_at
+        }
+        for n in notifications
+    ]
+
+================================================================================
+FILE: api/routes/employee/holidays.py
+================================================================================
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from sqlalchemy.future import select
+from app.db.session import get_db
+from app.api.dependencies import get_current_user
+from app.models.domain import User
+
+router = APIRouter()
+
+
+# =========================
+# GET ALL HOLIDAYS
+# =========================
+
+@router.get("/holidays")
+async def get_holidays(
+    current_user: User = Depends(get_current_user),  # ← Get full User object
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get all holidays for their tenant"""
+    
+    # current_user is already the User object, get tenant_id from it
+    tenant_id = current_user.tenant_id
+
+    result = await db.execute(text("""
+        SELECT *
+        FROM holidays
+        WHERE tenant_id = :tenant_id
+        ORDER BY holiday_date
+    """), {"tenant_id": tenant_id})
+
+    return result.mappings().all()
+
+
+# =========================
+# UPCOMING HOLIDAY
+# =========================
+
+@router.get("/holidays/upcoming")
+async def upcoming_holiday(
+    current_user: User = Depends(get_current_user),  # ← Get full User object
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Get next upcoming holiday"""
+    
+    tenant_id = current_user.tenant_id
+
+    result = await db.execute(text("""
+        SELECT *
+        FROM holidays
+        WHERE tenant_id = :tenant_id
+        AND holiday_date >= CURRENT_DATE
+        ORDER BY holiday_date
+        LIMIT 1
+    """), {"tenant_id": tenant_id})
+
+    return result.mappings().first()
+
+================================================================================
+FILE: api/routes/org_admin/attendance.py
+================================================================================
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from datetime import date
+from app.db.session import get_db
+from app.api.dependencies import get_current_user, require_role
+from app.models.domain import User
+
+router = APIRouter()
+
+
+@router.get("/attendance/today")
+async def today_attendance(
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(text("""
+        SELECT 
+            u.id, u.name, u.employee_code,
+            MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
+            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out,
+            CASE WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') IS NOT NULL 
+                THEN 'present' ELSE 'absent' END as status
+        FROM users u
+        LEFT JOIN attendance_logs a ON u.id = a.user_id AND DATE(a.timestamp) = CURRENT_DATE
+        WHERE u.tenant_id = :tenant_id AND u.dept_id = :dept_id 
+        AND u.role = 'employee' AND u.is_active = true
+        GROUP BY u.id ORDER BY u.name
+    """), {"tenant_id": current_user.tenant_id, "dept_id": current_user.dept_id})
+    return result.mappings().all()
+
+
+@router.get("/attendance/date/{attendance_date}")
+async def attendance_by_date(
+    attendance_date: date,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(text("""
+        SELECT 
+            u.id, u.name, u.employee_code,
+            MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
+            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out,
+            CASE WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') IS NOT NULL 
+                THEN 'present' ELSE 'absent' END as status
+        FROM users u
+        LEFT JOIN attendance_logs a ON u.id = a.user_id AND DATE(a.timestamp) = :attendance_date
+        WHERE u.tenant_id = :tenant_id AND u.dept_id = :dept_id 
+        AND u.role = 'employee' AND u.is_active = true
+        GROUP BY u.id ORDER BY u.name
+    """), {"tenant_id": current_user.tenant_id, "dept_id": current_user.dept_id, "attendance_date": attendance_date})
+    return result.mappings().all()
+
+================================================================================
+FILE: api/routes/org_admin/__init__.py
+================================================================================
+
+from app.api.routes.org_admin import (
+    dashboard,
+    employees,
+    attendance,
+    leaves,
+    holidays,
+    devices  # ← ADD THIS
+)
+
+================================================================================
+FILE: api/routes/org_admin/dashboard.py
+================================================================================
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from app.db.session import get_db
+from app.api.dependencies import get_current_user, require_role
+from app.models.domain import User
+
+router = APIRouter()
+
+
+@router.get("/dashboard")
+async def org_admin_dashboard(
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Org Admin: View department dashboard"""
+    
+    dept_id = current_user.dept_id
+    tenant_id = current_user.tenant_id
+    
+    # Department info
+    dept_info = await db.execute(text("""
+        SELECT department_name
+        FROM departments
+        WHERE department_id = :dept_id
+    """), {"dept_id": dept_id})
+    dept_name = dept_info.scalar()
+    
+    # Employee stats
+    emp_stats = await db.execute(text("""
+        SELECT 
+            COUNT(*) as total_employees,
+            COUNT(*) FILTER (WHERE is_active = true) as active_employees,
+            COUNT(*) FILTER (WHERE finger_id IS NOT NULL) as enrolled_employees
+        FROM users
+        WHERE tenant_id = :tenant_id
+        AND dept_id = :dept_id
+        AND role = 'employee'
+    """), {
+        "tenant_id": tenant_id,
+        "dept_id": dept_id
+    })
+    emp_data = emp_stats.mappings().first()
+    
+    # Today's attendance
+    att_stats = await db.execute(text("""
+        SELECT 
+            COUNT(DISTINCT user_id) as present_today,
+            COUNT(DISTINCT user_id) FILTER (
+                WHERE timestamp::time <= '09:15:00'
+            ) as on_time,
+            COUNT(DISTINCT user_id) FILTER (
+                WHERE timestamp::time > '09:15:00'
+            ) as late
+        FROM attendance_logs
+        WHERE tenant_id = :tenant_id
+        AND user_id IN (
+            SELECT id FROM users WHERE dept_id = :dept_id AND role = 'employee'
+        )
+        AND DATE(timestamp) = CURRENT_DATE
+        AND record_type = 'IN'
+    """), {
+        "tenant_id": tenant_id,
+        "dept_id": dept_id
+    })
+    att_data = att_stats.mappings().first()
+    
+    # Pending leaves
+    leave_stats = await db.execute(text("""
+        SELECT COUNT(*) as pending_leaves
+        FROM leaves l
+        JOIN users u ON l.employee_id = u.id
+        WHERE l.tenant_id = :tenant_id
+        AND u.dept_id = :dept_id
+        AND l.status = 'pending'
+    """), {
+        "tenant_id": tenant_id,
+        "dept_id": dept_id
+    })
+    leave_data = leave_stats.mappings().first()
+    
+    return {
+        "department": dept_name,
+        "employees": {
+            "total": emp_data["total_employees"] or 0,
+            "active": emp_data["active_employees"] or 0,
+            "enrolled": emp_data["enrolled_employees"] or 0
+        },
+        "attendance_today": {
+            "present": att_data["present_today"] or 0,
+            "on_time": att_data["on_time"] or 0,
+            "late": att_data["late"] or 0,
+            "absent": (emp_data["active_employees"] or 0) - (att_data["present_today"] or 0)
+        },
+        "pending_leaves": leave_data["pending_leaves"] or 0
+    }
+
+================================================================================
+FILE: api/routes/org_admin/leaves.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text, insert
+from app.db.session import get_db
+from app.api.dependencies import get_current_user, require_role
+from app.models.domain import User, Notification
+
+router = APIRouter()
+
+
+# =========================
+# BACKGROUND TASKS
+# =========================
+
+async def notify_leave_approved_bg(
+    tenant_id: int,
+    approver_id: int,
+    employee_id: int,
+    leave_id: int,
+    leave_type: str,
+    start_date: str,
+    end_date: str,
+    db: AsyncSession
+):
+    """Background task: Notify employee of leave approval"""
+    
+    await db.execute(insert(Notification).values([{
+        "tenant_id": tenant_id,
+        "actor_id": approver_id,
+        "actor_name": "Department Head",
+        "recipient_id": employee_id,
+        "event_type": "leave_approved_dept",
+        "entity_type": "Leave",
+        "entity_id": leave_id,
+        "entity_name": f"{leave_type} leave",
+        "title": "Leave Approved (Department)",
+        "message": f"Your {leave_type} leave from {start_date} to {end_date} was approved by department head",
+        "is_read": False
+    }]))
+    await db.commit()
+
+
+# =========================
+# ROUTES
+# =========================
+
+@router.get("/leaves")
+async def list_department_leaves(
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Org Admin: List leave requests for department"""
+    result = await db.execute(text("""
+        SELECT l.leave_id, u.name as employee_name, u.employee_code,
+            l.leave_type, l.start_date, l.end_date, l.reason, l.status, l.created_at
+        FROM leaves l
+        JOIN users u ON l.employee_id = u.id
+        WHERE l.tenant_id = :tenant_id AND u.dept_id = :dept_id
+        ORDER BY l.created_at DESC
+    """), {"tenant_id": current_user.tenant_id, "dept_id": current_user.dept_id})
+    return result.mappings().all()
+
+
+@router.patch("/leaves/{leave_id}/approve")
+async def approve_leave(
+    leave_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Org Admin: Approve leave request (first level)"""
+    
+    # Get leave details
+    leave_info = await db.execute(text("""
+        SELECT l.employee_id, l.leave_type, l.start_date, l.end_date, u.name as employee_name
+        FROM leaves l
+        JOIN users u ON l.employee_id = u.id
+        WHERE l.leave_id = :leave_id
+    """), {"leave_id": leave_id})
+    info = leave_info.mappings().first()
+    
+    if not info:
+        raise HTTPException(404, "Leave request not found")
+    
+    result = await db.execute(text("""
+        UPDATE leaves l
+        SET status = 'approved_by_dept', dept_approved_at = NOW(), dept_approved_by = :admin_id
+        FROM users u
+        WHERE l.leave_id = :leave_id AND l.employee_id = u.id 
+        AND u.dept_id = :dept_id AND l.tenant_id = :tenant_id
+        RETURNING l.leave_id
+    """), {
+        "leave_id": leave_id,
+        "dept_id": current_user.dept_id,
+        "tenant_id": current_user.tenant_id,
+        "admin_id": current_user.id
+    })
+    
+    if result.rowcount == 0:
+        raise HTTPException(404, "Leave request not found or not in your department")
+    
+    await db.commit()
+    
+    # Schedule notification in BACKGROUND
+    background_tasks.add_task(
+        notify_leave_approved_bg,
+        tenant_id=current_user.tenant_id,
+        approver_id=current_user.id,
+        employee_id=info["employee_id"],
+        leave_id=leave_id,
+        leave_type=info["leave_type"],
+        start_date=str(info["start_date"]),
+        end_date=str(info["end_date"]),
+        db=db
+    )
+    
+    return {"message": "Leave approved at department level"}
+
+================================================================================
+FILE: api/routes/org_admin/employees.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, text, insert
+from sqlalchemy.future import select
+from pydantic import BaseModel
+from typing import Optional
+import secrets
+import string
+from app.db.session import get_db
+from app.api.dependencies import get_current_user, require_role
+from app.models.domain import User, Notification
+from app.core.security import hash_password
+
+router = APIRouter()
+
+
+def generate_strong_password(length: int = 10) -> str:
+    """Generate a strong random password"""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+class EmployeeCreate(BaseModel):
+    name: str
+    employee_code: Optional[str] = None
+    password: Optional[str] = None
+    finger_id: Optional[int] = None
+
+
+class EmployeeUpdate(BaseModel):
+    name: Optional[str] = None
+    finger_id: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class AssignFingerprintRequest(BaseModel):
+    finger_id: int
+
+
+# =========================
+# BACKGROUND TASKS
+# =========================
+
+async def notify_other_admins_bg(
+    tenant_id: int,
+    dept_id: int,
+    actor_id: int,
+    actor_name: str,
+    employee_id: int,
+    employee_name: str,
+    db: AsyncSession
+):
+    """Background task: Notify OTHER org admins about new employee"""
+    
+    # Get other org admins in this department
+    org_admins = await db.execute(text("""
+        SELECT id FROM users
+        WHERE tenant_id = :tenant_id
+        AND dept_id = :dept_id
+        AND role = 'org_admin'
+        AND is_active = true
+        AND id != :actor_id
+    """), {
+        "tenant_id": tenant_id,
+        "dept_id": dept_id,
+        "actor_id": actor_id
+    })
+    admin_ids = [row[0] for row in org_admins.all()]
+    
+    if not admin_ids:
+        return
+    
+    notification_values = []
+    for admin_id in admin_ids:
+        notification_values.append({
+            "tenant_id": tenant_id,
+            "actor_id": actor_id,
+            "actor_name": actor_name,
+            "recipient_id": admin_id,
+            "event_type": "employee_added",
+            "entity_type": "User",
+            "entity_id": employee_id,
+            "entity_name": employee_name,
+            "title": "New Employee Added",
+            "message": f"{employee_name} was added to your department",
+            "is_read": False
+        })
+    
+    await db.execute(insert(Notification).values(notification_values))
+    await db.commit()
+
+
+async def notify_employee_deactivated_bg(
+    tenant_id: int,
+    dept_id: int,
+    actor_id: int,
+    actor_name: str,
+    employee_id: int,
+    employee_name: str,
+    db: AsyncSession
+):
+    """Background task: Notify OTHER org admins about employee deactivation"""
+    
+    org_admins = await db.execute(text("""
+        SELECT id FROM users
+        WHERE tenant_id = :tenant_id
+        AND dept_id = :dept_id
+        AND role = 'org_admin'
+        AND is_active = true
+        AND id != :actor_id
+    """), {
+        "tenant_id": tenant_id,
+        "dept_id": dept_id,
+        "actor_id": actor_id
+    })
+    admin_ids = [row[0] for row in org_admins.all()]
+    
+    if not admin_ids:
+        return
+    
+    notification_values = []
+    for admin_id in admin_ids:
+        notification_values.append({
+            "tenant_id": tenant_id,
+            "actor_id": actor_id,
+            "actor_name": actor_name,
+            "recipient_id": admin_id,
+            "event_type": "employee_deactivated",
+            "entity_type": "User",
+            "entity_id": employee_id,
+            "entity_name": employee_name,
+            "title": "Employee Deactivated",
+            "message": f"{employee_name} has been deactivated",
+            "is_read": False
+        })
+    
+    await db.execute(insert(Notification).values(notification_values))
+    await db.commit()
+
+
+async def notify_fingerprint_enrolled_bg(
+    tenant_id: int,
+    actor_id: int,
+    employee_id: int,
+    employee_name: str,
+    finger_id: int,
+    db: AsyncSession
+):
+    """Background task: Notify employee about fingerprint enrollment"""
+    
+    await db.execute(insert(Notification).values([{
+        "tenant_id": tenant_id,
+        "actor_id": actor_id,
+        "actor_name": "System",
+        "recipient_id": employee_id,
+        "event_type": "fingerprint_enrolled",
+        "entity_type": "User",
+        "entity_id": employee_id,
+        "entity_name": employee_name,
+        "title": "Fingerprint Enrolled",
+        "message": f"Your fingerprint has been successfully registered (Slot {finger_id})",
+        "is_read": False
+    }]))
+    await db.commit()
+
+
+# =========================
+# ROUTES
+# =========================
+
+@router.get("/employees/available-finger-slots")
+async def available_finger_slots(
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id = current_user.tenant_id
+    result = await db.execute(
+        select(User.finger_id).where(User.tenant_id == tenant_id, User.finger_id.isnot(None))
+    )
+    used = set(result.scalars().all())
+    available = [i for i in range(1, 128) if i not in used]
+    return {"used": list(used), "available": available, "total": 127, "free_count": len(available)}
+
+
+@router.get("/employees")
+async def list_employees(
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(User).where(
+            User.tenant_id == current_user.tenant_id,
+            User.dept_id == current_user.dept_id,
+            User.role == "employee"
+        ).order_by(User.name)
+    )
+    return result.scalars().all()
+
+
+@router.post("/employees")
+async def create_employee(
+    data: EmployeeCreate,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id = current_user.tenant_id
+    dept_id = current_user.dept_id
+    
+    auto_generated = {"employee_code": False, "finger_id": False, "password": False}
+    
+    # AUTO-GENERATE employee_code
+    if not data.employee_code:
+        count_result = await db.execute(
+            select(func.count()).select_from(User).where(
+                User.tenant_id == tenant_id,
+                User.role == "employee"
+            )
+        )
+        emp_count = count_result.scalar() or 0
+        data.employee_code = f"EMP{tenant_id}{emp_count + 1:03d}"
+        auto_generated["employee_code"] = True
+    
+    # Check employee_code unique
+    existing = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant_id,
+            User.employee_code == data.employee_code
+        )
+    )
+    if existing.scalars().first():
+        raise HTTPException(400, "Employee code already exists")
+    
+    # AUTO-GENERATE password
+    original_password = data.password
+    if not data.password:
+        original_password = generate_strong_password(10)
+        auto_generated["password"] = True
+    
+    # AUTO-ASSIGN finger_id
+    if data.finger_id is None:
+        used_result = await db.execute(
+            select(User.finger_id).where(
+                User.tenant_id == tenant_id,
+                User.finger_id.isnot(None)
+            )
+        )
+        used = set(used_result.scalars().all())
+        for i in range(1, 128):
+            if i not in used:
+                data.finger_id = i
+                break
+        
+        if data.finger_id is None:
+            raise HTTPException(400, "No available fingerprint slots (1-127 all used)")
+        auto_generated["finger_id"] = True
+    else:
+        finger_check = await db.execute(
+            select(User).where(
+                User.tenant_id == tenant_id,
+                User.finger_id == data.finger_id
+            )
+        )
+        if finger_check.scalars().first():
+            raise HTTPException(400, f"Finger ID {data.finger_id} already assigned")
+    
+    # Create employee
+    user = User(
+        tenant_id=tenant_id,
+        employee_code=data.employee_code,
+        name=data.name,
+        email=None,
+        dept_id=dept_id,
+        finger_id=data.finger_id,
+        role="employee",
+        password_hash=hash_password(original_password)
+    )
+    
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    
+    # Schedule notification in BACKGROUND
+    background_tasks.add_task(
+        notify_other_admins_bg,
+        tenant_id=tenant_id,
+        dept_id=dept_id,
+        actor_id=current_user.id,
+        actor_name=current_user.name,
+        employee_id=user.id,
+        employee_name=user.name,
+        db=db
+    )
+    
+    return {
+        "message": "Employee created successfully",
+        "credentials": {
+            "name": user.name,
+            "employee_code": user.employee_code,
+            "password": original_password,
+            "finger_id": user.finger_id
+        },
+        "auto_generated": auto_generated,
+        "instructions": "Share these credentials with the employee. They should change password on first login."
+    }
+
+
+@router.patch("/employees/{employee_id}/assign-fingerprint")
+async def assign_fingerprint(
+    employee_id: int,
+    data: AssignFingerprintRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id, dept_id = current_user.tenant_id, current_user.dept_id
+    result = await db.execute(
+        select(User).where(
+            User.id == employee_id,
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "employee"
+        )
+    )
+    employee = result.scalars().first()
+    if not employee:
+        raise HTTPException(404, "Employee not found in your department")
+    
+    finger_check = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant_id,
+            User.finger_id == data.finger_id,
+            User.id != employee_id
+        )
+    )
+    if finger_check.scalars().first():
+        raise HTTPException(400, f"Finger ID {data.finger_id} already in use")
+    
+    employee.finger_id = data.finger_id
+    await db.commit()
+    
+    # Schedule notification in BACKGROUND
+    background_tasks.add_task(
+        notify_fingerprint_enrolled_bg,
+        tenant_id=tenant_id,
+        actor_id=current_user.id,
+        employee_id=employee.id,
+        employee_name=employee.name,
+        finger_id=data.finger_id,
+        db=db
+    )
+    
+    return {
+        "message": f"Fingerprint slot {data.finger_id} assigned",
+        "employee_id": employee.id,
+        "finger_id": data.finger_id
+    }
+
+
+@router.put("/employees/{employee_id}")
+async def update_employee(
+    employee_id: int,
+    data: EmployeeUpdate,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id, dept_id = current_user.tenant_id, current_user.dept_id
+    result = await db.execute(
+        select(User).where(
+            User.id == employee_id,
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "employee"
+        )
+    )
+    employee = result.scalars().first()
+    if not employee:
+        raise HTTPException(404, "Employee not found in your department")
+    
+    was_active = employee.is_active
+    
+    if data.name is not None:
+        employee.name = data.name
+    if data.finger_id is not None:
+        if data.finger_id != employee.finger_id:
+            check = await db.execute(
+                select(User).where(
+                    User.tenant_id == tenant_id,
+                    User.finger_id == data.finger_id,
+                    User.id != employee_id
+                )
+            )
+            if check.scalars().first():
+                raise HTTPException(400, "Finger ID already in use")
+        employee.finger_id = data.finger_id
+    if data.is_active is not None:
+        employee.is_active = data.is_active
+        if not data.is_active:
+            employee.finger_id = None
+    
+    await db.commit()
+    
+    # Schedule notification in BACKGROUND if deactivated
+    if was_active and employee.is_active is False:
+        background_tasks.add_task(
+            notify_employee_deactivated_bg,
+            tenant_id=tenant_id,
+            dept_id=dept_id,
+            actor_id=current_user.id,
+            actor_name=current_user.name,
+            employee_id=employee.id,
+            employee_name=employee.name,
+            db=db
+        )
+    
+    return {"message": "Employee updated successfully"}
+
+
+@router.delete("/employees/{employee_id}")
+async def delete_employee(
+    employee_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id, dept_id = current_user.tenant_id, current_user.dept_id
+    result = await db.execute(
+        select(User).where(
+            User.id == employee_id,
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "employee"
+        )
+    )
+    employee = result.scalars().first()
+    if not employee:
+        raise HTTPException(404, "Employee not found in your department")
+    
+    employee.is_active = False
+    employee.finger_id = None
+    await db.commit()
+    
+    # Schedule notification in BACKGROUND
+    background_tasks.add_task(
+        notify_employee_deactivated_bg,
+        tenant_id=tenant_id,
+        dept_id=dept_id,
+        actor_id=current_user.id,
+        actor_name=current_user.name,
+        employee_id=employee.id,
+        employee_name=employee.name,
+        db=db
+    )
+    
+    return {"message": "Employee deactivated successfully"}
+
+
+@router.get("/employees/{employee_id}")
+async def get_employee(
+    employee_id: int,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    tenant_id, dept_id = current_user.tenant_id, current_user.dept_id
+    result = await db.execute(
+        select(User).where(
+            User.id == employee_id,
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "employee"
+        )
+    )
+    employee = result.scalars().first()
+    if not employee:
+        raise HTTPException(404, "Employee not found in your department")
+    return {
+        "id": employee.id,
+        "name": employee.name,
+        "employee_code": employee.employee_code,
+        "finger_id": employee.finger_id,
+        "is_active": employee.is_active
+    }
+
+================================================================================
+FILE: api/routes/org_admin/holidays.py
+================================================================================
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from app.db.session import get_db
+from app.api.dependencies import get_current_user, require_role
+from app.models.domain import User
+
+router = APIRouter()
+
+
+@router.get("/holidays")
+async def list_holidays(
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(text("SELECT * FROM holidays WHERE tenant_id = :tenant_id ORDER BY holiday_date"), {"tenant_id": current_user.tenant_id})
+    return result.mappings().all()
+
+
+@router.get("/holidays/upcoming")
+async def upcoming_holidays(
+    limit: int = 5,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(text("SELECT * FROM holidays WHERE tenant_id = :tenant_id AND holiday_date >= CURRENT_DATE ORDER BY holiday_date LIMIT :limit"), {"tenant_id": current_user.tenant_id, "limit": limit})
+    return result.mappings().all()
+
+================================================================================
+FILE: api/routes/org_admin/devices.py
+================================================================================
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import text
+from pydantic import BaseModel
+from app.db.session import get_db
+from app.api.dependencies import get_current_user, require_role
+from app.models.domain import User, Device, Command
+from app.mqtt.client import mqtt_manager
+
+router = APIRouter()
+
+
+# =========================
+# SCHEMAS
+# =========================
+
+class FireCommandRequest(BaseModel):
+    device_id: str
+    command: str  # 'enroll' or 'delete'
+    target_id: int  # finger_id
+
+
+# =========================
+# ROUTES
+# =========================
+
+@router.get("/devices")
+async def list_devices(
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Org Admin: List all devices in their tenant"""
+    
+    result = await db.execute(
+        select(Device)
+        .where(Device.tenant_id == current_user.tenant_id)
+        .order_by(Device.device_id)
+    )
+    devices = result.scalars().all()
+    
+    return [
+        {
+            "device_id": d.device_id,
+            "status": d.status,
+            "last_seen": d.last_seen
+        }
+        for d in devices
+    ]
+
+
+@router.get("/devices/{device_id}")
+async def get_device(
+    device_id: str,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Org Admin: Get device details"""
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == device_id,
+            Device.tenant_id == current_user.tenant_id
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(404, "Device not found")
+    
+    # Get recent commands for this device
+    commands = await db.execute(text("""
+        SELECT id, command, target_id, status, created_at
+        FROM commands
+        WHERE device_id = :device_id
+        AND tenant_id = :tenant_id
+        ORDER BY created_at DESC
+        LIMIT 20
+    """), {
+        "device_id": device_id,
+        "tenant_id": current_user.tenant_id
+    })
+    
+    return {
+        "device_id": device.device_id,
+        "status": device.status,
+        "last_seen": device.last_seen,
+        "recent_commands": commands.mappings().all()
+    }
+
+
+@router.get("/devices/status")
+async def devices_status(
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Org Admin: Get devices status summary"""
+    
+    result = await db.execute(text("""
+        SELECT 
+            COUNT(*) as total,
+            COUNT(*) FILTER (WHERE status = 'online') as online,
+            COUNT(*) FILTER (WHERE status != 'online') as offline
+        FROM devices
+        WHERE tenant_id = :tenant_id
+    """), {"tenant_id": current_user.tenant_id})
+    
+    return result.mappings().first()
+
+
+@router.post("/devices/fire-command")
+async def fire_device_command(
+    data: FireCommandRequest,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Org Admin: Send command to device (enroll/delete fingerprint)
+    
+    This allows Org Admin to directly enroll fingerprints without
+    going through Tenant Manager.
+    """
+    
+    # Verify device belongs to this tenant
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == data.device_id,
+            Device.tenant_id == current_user.tenant_id
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(404, "Device not found in your organization")
+    
+    # Validate command type
+    if data.command not in ["enroll", "delete"]:
+        raise HTTPException(400, "Command must be 'enroll' or 'delete'")
+    
+    # Validate target_id (finger_id) range
+    if data.target_id < 1 or data.target_id > 127:
+        raise HTTPException(400, "Finger ID must be between 1 and 127")
+    
+    # For enroll command, verify the finger_id is assigned to an employee
+    if data.command == "enroll":
+        from app.models.domain import User
+        emp_result = await db.execute(
+            select(User).where(
+                User.tenant_id == current_user.tenant_id,
+                User.finger_id == data.target_id,
+                User.is_active == True
+            )
+        )
+        employee = emp_result.scalars().first()
+        if not employee:
+            raise HTTPException(400, f"No active employee assigned to finger ID {data.target_id}")
+    
+    # Create command record
+    cmd = Command(
+        tenant_id=current_user.tenant_id,
+        device_id=data.device_id,
+        command=data.command,
+        target_id=data.target_id
+    )
+    
+    db.add(cmd)
+    await db.commit()
+    await db.refresh(cmd)
+    
+    # Publish MQTT command
+    mqtt_manager.publish_command(
+        current_user.tenant_id,
+        data.device_id,
+        cmd.id,
+        data.command,
+        data.target_id
+    )
+    
+    return {
+        "message": f"Command '{data.command}' dispatched successfully",
+        "command_id": cmd.id,
+        "device_id": data.device_id,
+        "target_id": data.target_id
+    }
+
+================================================================================
+FILE: mqtt/client.py
+================================================================================
+
+import paho.mqtt.client as mqtt
+import json
+import asyncio
+import logging
+from app.core.config import settings
+from app.db.session import AsyncSessionLocal
+from app.models.domain import Command, CommandStatus
+from sqlalchemy import update
+
+logger = logging.getLogger(__name__)
+
+
+class MQTTManager:
+    def __init__(self):
+        self.client = mqtt.Client(client_id="gridsphere_backend")
+        self.loop = None  # store main event loop
+
+        if settings.MQTT_USER:
+            self.client.username_pw_set(settings.MQTT_USER, settings.MQTT_PASS)
+
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+
+    def start(self):
+        try:
+            # store current running loop
+            try:
+                self.loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+
+            self.client.connect(settings.MQTT_BROKER, settings.MQTT_PORT, 60)
+            self.client.loop_start()
+
+            logger.info(f"MQTT Client started. Broker: {settings.MQTT_BROKER}")
+        except Exception as e:
+            logger.error(f"Failed to connect to MQTT Broker: {e}")
+
+    def stop(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            logger.info("Connected to MQTT Broker successfully.")
+            client.subscribe("gridsphere/+/+/acks")
+        else:
+            logger.error(f"MQTT Connection failed with code {rc}")
+
+    def on_message(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode())
+            command_id = payload.get("cmd_id")
+            status = payload.get("status")
+
+            if command_id and status:
+                # ✅ SAFE async execution (no asyncio.run)
+                if self.loop and self.loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        self.update_command_status(command_id, status),
+                        self.loop
+                    )
+                else:
+                    logger.error("Event loop not available for MQTT async task")
+
+        except Exception as e:
+            logger.error(f"MQTT Message Error: {e}")
+
+    async def update_command_status(self, command_id: int, status: str):
+        async with AsyncSessionLocal() as db:
+            try:
+                await db.execute(
+                    update(Command)
+                    .where(Command.id == command_id)
+                    .values(
+                        status=CommandStatus.SUCCESS
+                        if status == "success"
+                        else CommandStatus.FAILED
+                    )
+                )
+                await db.commit()
+
+                logger.info(f"Updated Command {command_id} status to {status}")
+
+            except Exception as e:
+                logger.error(f"Database update error from MQTT: {e}")
+                await db.rollback()
+
+    def publish_command(
+        self,
+        tenant_id: int,
+        device_id: str,
+        command_id: int,
+        command: str,
+        target_id: int
+    ):
+        topic = f"gridsphere/{tenant_id}/{device_id}/commands"
+
+        payload = json.dumps({
+            "cmd_id": command_id,
+            "command": command,
+            "target_id": target_id
+        })
+
+        self.client.publish(topic, payload, qos=1)
+
+        logger.info(f"Published command {command} to {topic}")
+
+
+mqtt_manager = MQTTManager()
+
+================================================================================
+FILE: services/notification_service.py
+================================================================================
+
+"""
+Notification Service - Single table design with per-recipient rows
+"""
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import text, func
+from typing import List, Optional
+from app.models.domain import Notification, User
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+async def create_notifications_for_recipients(
+    db: AsyncSession,
+    tenant_id: int,
+    actor_id: int,
+    recipient_ids: List[int],
+    event_type: str,
+    title: str,
+    message: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """
+    Create notification rows for multiple recipients.
+    Each recipient gets their own row with independent read status.
+    """
+    
+    # Get actor name once (denormalize)
+    actor_name = None
+    if actor_id:
+        result = await db.execute(
+            select(User.name).where(User.id == actor_id)
+        )
+        actor_name = result.scalar() or "System"
+    else:
+        actor_name = "System"
+    
+    # Batch insert - one row per recipient
+    count = 0
+    for recipient_id in recipient_ids:
+        notification = Notification(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            recipient_id=recipient_id,
+            event_type=event_type,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            entity_name=entity_name,
+            title=title,
+            message=message,
+            is_read=False
+        )
+        db.add(notification)
+        count += 1
+    
+    await db.commit()
+    logger.info(f"Created {count} notifications for event '{event_type}'")
+    return count
+
+
+async def notify_department_admins_except_actor(
+    db: AsyncSession,
+    tenant_id: int,
+    dept_id: int,
+    actor_id: int,
+    event_type: str,
+    title: str,
+    message_template: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """
+    Notify all Org Admins in a department EXCEPT the actor.
+    Each admin gets their own notification row.
+    """
+    
+    # Get all org admins in this department EXCEPT the actor
+    result = await db.execute(
+        select(User.id).where(
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "org_admin",
+            User.is_active == True,
+            User.id != actor_id
+        )
+    )
+    admins = result.all()
+    
+    if not admins:
+        logger.info(f"No other org admins to notify in dept {dept_id}")
+        return 0
+    
+    recipient_ids = [admin[0] for admin in admins]
+    message = message_template.format(entity_name=entity_name or "Unknown")
+    
+    return await create_notifications_for_recipients(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        recipient_ids=recipient_ids,
+        event_type=event_type,
+        title=title,
+        message=message,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_name=entity_name
+    )
+
+
+async def notify_all_department_admins(
+    db: AsyncSession,
+    tenant_id: int,
+    dept_id: int,
+    actor_id: int,
+    event_type: str,
+    title: str,
+    message_template: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """
+    Notify ALL Org Admins in a department (including the actor).
+    Used for leave requests where actor is employee, not admin.
+    """
+    
+    result = await db.execute(
+        select(User.id).where(
+            User.tenant_id == tenant_id,
+            User.dept_id == dept_id,
+            User.role == "org_admin",
+            User.is_active == True
+        )
+    )
+    admins = result.all()
+    
+    if not admins:
+        logger.info(f"No org admins to notify in dept {dept_id}")
+        return 0
+    
+    recipient_ids = [admin[0] for admin in admins]
+    message = message_template.format(entity_name=entity_name or "Unknown")
+    
+    return await create_notifications_for_recipients(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        recipient_ids=recipient_ids,
+        event_type=event_type,
+        title=title,
+        message=message,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_name=entity_name
+    )
+
+
+async def notify_single_user(
+    db: AsyncSession,
+    tenant_id: int,
+    actor_id: int,
+    recipient_id: int,
+    event_type: str,
+    title: str,
+    message: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """Notify a single user"""
+    return await create_notifications_for_recipients(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        recipient_ids=[recipient_id],
+        event_type=event_type,
+        title=title,
+        message=message,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_name=entity_name
+    )
+
+
+async def notify_multiple_users(
+    db: AsyncSession,
+    tenant_id: int,
+    actor_id: int,
+    recipient_ids: List[int],
+    event_type: str,
+    title: str,
+    message: str,
+    entity_type: str = None,
+    entity_id: int = None,
+    entity_name: str = None
+) -> int:
+    """Notify multiple specific users"""
+    return await create_notifications_for_recipients(
+        db=db,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        recipient_ids=recipient_ids,
+        event_type=event_type,
+        title=title,
+        message=message,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_name=entity_name
+    )
+
+================================================================================
+FILE: services/user_service.py
+================================================================================
+
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from app.models.domain import User
+
+
+# =========================
+# ENROLL USER (FIXED ✅)
+# =========================
+
+async def enroll_user(
+    tenant_id: int,
+    finger_id: int,
+    name: str,
+    employee_code: str,
+    db: AsyncSession
+):
+    # =========================
+    # CHECK: employee_code unique per tenant
+    # =========================
+    existing = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant_id,
+            User.employee_code == employee_code
+        )
+    )
+    if existing.scalars().first():
+        raise HTTPException(
+            status_code=400,
+            detail="Employee code already exists for this tenant."
+        )
+
+    # =========================
+    # CHECK: finger_id unique per tenant
+    # =========================
+    existing_finger = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant_id,
+            User.finger_id == finger_id
+        )
+    )
+    if existing_finger.scalars().first():
+        raise HTTPException(
+            status_code=400,
+            detail="Finger ID already assigned for this tenant."
+        )
+
+    # =========================
+    # CREATE USER
+    # =========================
+    user = User(
+        tenant_id=tenant_id,
+        finger_id=finger_id,
+        name=name,
+        employee_code=employee_code
+    )
+
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    return user
+
+
+# =========================
+# DELETE USER
+# =========================
+
+async def delete_user(
+    tenant_id: int,
+    finger_id: int,
+    db: AsyncSession
+):
+    result = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant_id,
+            User.finger_id == finger_id
+        )
+    )
+    user = result.scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found."
+        )
+
+    await db.delete(user)
+    await db.commit()
+
+    return {"message": "User deleted successfully"}
+
+================================================================================
+FILE: services/attendance_service.py
+================================================================================
+
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.future import select
+from sqlalchemy import desc
+from app.models.domain import AttendanceLog, User
+import datetime
+from datetime import timedelta
+
+
+# =========================
+# HELPER: GET USER BY FINGER
+# =========================
+
+async def get_user_by_finger(tenant_id: int, finger_id: int, db: AsyncSession):
+    result = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant_id,
+            User.finger_id == finger_id
+        )
+    )
+    return result.scalars().first()
+
+
+# =========================
+# SINGLE ATTENDANCE
+# =========================
+
+async def process_attendance(
+    tenant_id: int,
+    device_id: str,
+    finger_id: int,
+    db: AsyncSession
+):
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # =========================
+    # 1. GET USER
+    # =========================
+    user = await get_user_by_finger(tenant_id, finger_id, db)
+
+    user_id = user.id if user else None
+    user_name = user.name if user else "Unknown User"
+    employee_code = user.employee_code if user else None
+
+    # =========================
+    # 2. TODAY START
+    # =========================
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # =========================
+    # 3. LAST LOG
+    # =========================
+    result = await db.execute(
+        select(AttendanceLog)
+        .where(
+            AttendanceLog.tenant_id == tenant_id,
+            AttendanceLog.finger_id == finger_id,
+            AttendanceLog.timestamp >= today
+        )
+        .order_by(desc(AttendanceLog.timestamp))
+        .limit(1)
+    )
+
+    last_log = result.scalars().first()
+
+    # =========================
+    # 4. SMART LOGIC
+    # =========================
+    current_type = "IN"
+
+    if last_log:
+        time_diff = now - last_log.timestamp
+
+        # 🚨 Prevent duplicate scan within 5 minutes
+        if time_diff < timedelta(minutes=1):
+            return last_log, user_name
+
+        current_type = "OUT" if last_log.record_type == "IN" else "IN"
+
+    # =========================
+    # 5. SAVE LOG
+    # =========================
+    log = AttendanceLog(
+        tenant_id=tenant_id,
+        device_id=device_id,
+        finger_id=finger_id,
+        user_id=user_id,   # ✅ NEW
+        timestamp=now,
+        record_type=current_type
+    )
+
+    db.add(log)
+    await db.commit()
+    await db.refresh(log)
+
+    return log, user_name
+
+
+# =========================
+# BULK ATTENDANCE (OFFLINE)
+# =========================
+
+async def process_bulk_attendance(
+    tenant_id: int,
+    device_id: str,
+    logs: list,
+    db: AsyncSession
+):
+    if not logs:
+        return 0
+
+    values = []
+
+    for l in logs:
+        user = await get_user_by_finger(tenant_id, l.finger_id, db)
+
+        values.append({
+            "tenant_id": tenant_id,
+            "device_id": device_id,
+            "finger_id": l.finger_id,
+            "user_id": user.id if user else None,  # ✅ NEW
+            "timestamp": l.timestamp,
+            "record_type": "IN"
+        })
+
+    stmt = insert(AttendanceLog).values(values)
+    stmt = stmt.on_conflict_do_nothing(
+        constraint='uix_attendance_record'
+    )
+
+    result = await db.execute(stmt)
+    await db.commit()
+
+    return result.rowcount or 0
+
+
+# =========================
+# HISTORY
+# =========================
+
+async def get_attendance_history(
+    tenant_id: int,
+    db: AsyncSession
+):
+    stmt = (
+        select(
+            AttendanceLog,
+            User.name,
+            User.employee_code
+        )
+        .outerjoin(
+            User,
+            AttendanceLog.user_id == User.id   # ✅ FIXED JOIN
+        )
+        .where(AttendanceLog.tenant_id == tenant_id)
+        .order_by(AttendanceLog.timestamp.desc())
+        .limit(50)
+    )
+
+    result = await db.execute(stmt)
+
+    response_data = []
+
+    for row in result.mappings():
+        log = row["AttendanceLog"]
+        user_name = row["name"]
+        employee_code = row["employee_code"]
+
+        response_data.append({
+            "timestamp": log.timestamp,
+            "finger_id": log.finger_id,
+            "user_id": log.user_id,              # ✅ NEW
+            "employee_code": employee_code,      # ✅ NEW
+            "device_id": log.device_id,
+            "record_type": log.record_type,
+            "user_name": user_name or "Unknown"
+        })
+
+    return response_data

@@ -2,8 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import text
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import Optional
+import secrets
+import string
+
 from app.db.session import get_db
 from app.api.dependencies import verify_tenant_api_key
 from app.models.domain import Tenant, Department, User
@@ -13,14 +16,24 @@ router = APIRouter()
 
 
 # =========================
+# HELPER
+# =========================
+
+def generate_strong_password(length: int = 12) -> str:
+    """Generate a strong random password"""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+# =========================
 # SCHEMAS
 # =========================
 
 class OrgAdminCreate(BaseModel):
     name: str
-    email: str
-    password: str
+    email: EmailStr  # This is the unique username
     dept_id: int
+    # No password field - auto-generated
 
 
 class OrgAdminUpdate(BaseModel):
@@ -68,7 +81,7 @@ async def create_org_admin(
     tenant: Tenant = Depends(verify_tenant_api_key),
     db: AsyncSession = Depends(get_db)
 ):
-    """Tenant Manager: Create a new org admin (department admin)"""
+    """Tenant Manager: Create org admin - just name, email, department. Password auto-generated."""
     
     # Verify department belongs to tenant
     dept_result = await db.execute(
@@ -81,21 +94,27 @@ async def create_org_admin(
     if not dept_result.scalars().first():
         raise HTTPException(400, "Invalid or inactive department")
     
-    # Check email unique
+    # Check email unique (username)
     existing = await db.execute(
         select(User).where(User.email == data.email)
     )
     if existing.scalars().first():
         raise HTTPException(400, "Email already exists")
     
+    # Auto-generate password
+    auto_password = generate_strong_password(12)
+    
+    # Create org admin
     org_admin = User(
         tenant_id=tenant.id,
         name=data.name,
         email=data.email,
-        password_hash=hash_password(data.password),
+        password_hash=hash_password(auto_password),
         dept_id=data.dept_id,
         role="org_admin",
-        employee_code=None
+        employee_code=None,
+        finger_id=None,
+        is_active=True
     )
     
     db.add(org_admin)
@@ -110,7 +129,12 @@ async def create_org_admin(
             "email": org_admin.email,
             "dept_id": org_admin.dept_id,
             "role": org_admin.role
-        }
+        },
+        "credentials": {
+            "email": org_admin.email,
+            "password": auto_password
+        },
+        "instructions": "Share these credentials. They can change password after first login via /api/auth/change-password"
     }
 
 
