@@ -5,24 +5,18 @@ services:
     restart: always
     environment:
       - PROJECT_NAME=BioMetric
-      # Connecting to your existing container named 'postgres_db'
       - DATABASE_URL=postgresql+asyncpg://grid:strongpassword@postgres_db:5432/biometric
-      - REDIS_URL=redis://localhost:6379/0
+      - REDIS_URL=redis://172.17.0.1:6379/0  # Use the Gateway IP for host Redis
       - MQTT_BROKER=187.127.141.155
       - MQTT_PORT=1883
       - MQTT_USER=esp8266
       - MQTT_PASS=strongpassword123
     ports:
       - "9000:8000"
-    networks:
-      - biometric_net
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
 
-networks:
-  biometric_net:
-    external: true
-    name: bridge
+# No 'networks' block needed here anymore
