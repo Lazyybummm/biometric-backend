@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import text
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Optional
 from app.db.session import get_db
 from app.api.dependencies import get_current_user, require_role
 from app.models.domain import User, Device, Command
@@ -11,19 +12,52 @@ from app.mqtt.client import mqtt_manager
 router = APIRouter()
 
 
-# =========================
-# SCHEMAS
-# =========================
+class DeviceCreate(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=100)
+    secret_key: str = Field(..., min_length=8)
+
 
 class FireCommandRequest(BaseModel):
     device_id: str
     command: str  # 'enroll' or 'delete'
-    target_id: int  # finger_id
+    target_id: int
 
 
-# =========================
-# ROUTES
-# =========================
+@router.post("/devices")
+async def create_device(
+    data: DeviceCreate,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Org Admin: Register a new device for their department's tenant"""
+    
+    # Check if device exists
+    existing = await db.execute(
+        select(Device).where(
+            Device.tenant_id == current_user.tenant_id,
+            Device.device_id == data.device_id
+        )
+    )
+    if existing.scalars().first():
+        raise HTTPException(400, "Device ID already exists")
+    
+    device = Device(
+        tenant_id=current_user.tenant_id,
+        device_id=data.device_id,
+        secret_key=data.secret_key,
+        status="offline"
+    )
+    
+    db.add(device)
+    await db.commit()
+    await db.refresh(device)
+    
+    return {
+        "message": "Device registered successfully",
+        "device_id": device.device_id,
+        "secret_key": device.secret_key
+    }
+
 
 @router.get("/devices")
 async def list_devices(
@@ -33,9 +67,9 @@ async def list_devices(
     """Org Admin: List all devices in their tenant"""
     
     result = await db.execute(
-        select(Device)
-        .where(Device.tenant_id == current_user.tenant_id)
-        .order_by(Device.device_id)
+        select(Device).where(
+            Device.tenant_id == current_user.tenant_id
+        ).order_by(Device.device_id)
     )
     devices = result.scalars().all()
     
@@ -47,46 +81,6 @@ async def list_devices(
         }
         for d in devices
     ]
-
-
-@router.get("/devices/{device_id}")
-async def get_device(
-    device_id: str,
-    current_user: User = Depends(require_role("org_admin")),
-    db: AsyncSession = Depends(get_db)
-):
-    """Org Admin: Get device details"""
-    
-    result = await db.execute(
-        select(Device).where(
-            Device.device_id == device_id,
-            Device.tenant_id == current_user.tenant_id
-        )
-    )
-    device = result.scalars().first()
-    
-    if not device:
-        raise HTTPException(404, "Device not found")
-    
-    # Get recent commands for this device
-    commands = await db.execute(text("""
-        SELECT id, command, target_id, status, created_at
-        FROM commands
-        WHERE device_id = :device_id
-        AND tenant_id = :tenant_id
-        ORDER BY created_at DESC
-        LIMIT 20
-    """), {
-        "device_id": device_id,
-        "tenant_id": current_user.tenant_id
-    })
-    
-    return {
-        "device_id": device.device_id,
-        "status": device.status,
-        "last_seen": device.last_seen,
-        "recent_commands": commands.mappings().all()
-    }
 
 
 @router.get("/devices/status")
@@ -114,12 +108,7 @@ async def fire_device_command(
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Org Admin: Send command to device (enroll/delete fingerprint)
-    
-    This allows Org Admin to directly enroll fingerprints without
-    going through Tenant Manager.
-    """
+    """Org Admin: Send command to device (enroll/delete fingerprint)"""
     
     # Verify device belongs to this tenant
     result = await db.execute(
@@ -137,23 +126,23 @@ async def fire_device_command(
     if data.command not in ["enroll", "delete"]:
         raise HTTPException(400, "Command must be 'enroll' or 'delete'")
     
-    # Validate target_id (finger_id) range
+    # Validate target_id range
     if data.target_id < 1 or data.target_id > 127:
         raise HTTPException(400, "Finger ID must be between 1 and 127")
     
-    # For enroll command, verify the finger_id is assigned to an employee
+    # For enroll command, verify the finger_id is assigned to an employee in their department
     if data.command == "enroll":
-        from app.models.domain import User
         emp_result = await db.execute(
             select(User).where(
                 User.tenant_id == current_user.tenant_id,
                 User.finger_id == data.target_id,
+                User.dept_id == current_user.dept_id,
                 User.is_active == True
             )
         )
         employee = emp_result.scalars().first()
         if not employee:
-            raise HTTPException(400, f"No active employee assigned to finger ID {data.target_id}")
+            raise HTTPException(400, f"No active employee in your department assigned to finger ID {data.target_id}")
     
     # Create command record
     cmd = Command(
