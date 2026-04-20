@@ -209,6 +209,7 @@ class Settings(Base):
     working_days = Column(String, default="1,2,3,4,5")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
+
 # =========================
 # NOTIFICATIONS
 # =========================
@@ -241,3 +242,57 @@ class Notification(Base):
     read_at = Column(DateTime(timezone=True), nullable=True)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# =========================
+# LEAVE BALANCES (ADD THESE)
+# =========================
+
+class LeaveBalance(Base):
+    __tablename__ = "leave_balances"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    leave_type = Column(String, nullable=False)  # 'sick', 'casual', 'earned'
+    total_quota = Column(Integer, default=0)
+    used_quota = Column(Integer, default=0)
+    remaining_quota = Column(Integer, default=0)
+    year = Column(Integer, nullable=False)
+    last_updated = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'user_id', 'leave_type', 'year', name='uix_user_leave_balance_year'),
+        Index('ix_tenant_user_balance', 'tenant_id', 'user_id', 'year'),
+    )
+
+
+class LeaveSettings(Base):
+    __tablename__ = "leave_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, unique=True)
+    sick_leave_quota = Column(Integer, default=12)
+    casual_leave_quota = Column(Integer, default=12)
+    earned_leave_quota = Column(Integer, default=15)
+    reset_frequency = Column(String, default="yearly")  # 'yearly', 'monthly', 'never'
+    carry_forward_limit = Column(Integer, default=0)
+    auto_approve_limit = Column(Integer, default=0)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+
+class LeaveBalanceHistory(Base):
+    __tablename__ = "leave_balance_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    leave_type = Column(String, nullable=False)
+    previous_balance = Column(Integer, default=0)
+    new_balance = Column(Integer, default=0)
+    adjustment = Column(Integer, default=0)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)

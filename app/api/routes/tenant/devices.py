@@ -48,6 +48,21 @@ class DeviceMarkAttendanceResponse(BaseModel):
 
 
 # =========================
+# HELPER FUNCTION
+# =========================
+
+async def check_and_update_device_status(device: Device, db: AsyncSession):
+    """Check if device heartbeat is stale and update status accordingly"""
+    if device.status == "online" and device.last_seen:
+        stale_cutoff = datetime.utcnow() - timedelta(minutes=2)
+        if device.last_seen < stale_cutoff:
+            device.status = "offline"
+            await db.commit()
+            return False
+    return device.status == "online"
+
+
+# =========================
 # ESP DEVICE ENDPOINTS (Called by hardware)
 # =========================
 
@@ -497,7 +512,7 @@ async def fire_device_command(
 ):
     """Tenant Manager: Send command to device (enroll/delete fingerprint)"""
     
-    # Verify device exists and is online
+    # Verify device exists
     result = await db.execute(
         select(Device).where(
             Device.device_id == data.device_id,
@@ -509,7 +524,17 @@ async def fire_device_command(
     if not device:
         raise HTTPException(404, "Device not found")
     
-    # Check if device is online before sending command
+    # ✅ Check if device heartbeat is stale (TTL check - 2 minutes)
+    stale_cutoff = datetime.utcnow() - timedelta(minutes=2)
+    is_heartbeat_stale = device.last_seen and device.last_seen < stale_cutoff
+    
+    # Update device status based on heartbeat freshness
+    if is_heartbeat_stale:
+        device.status = "offline"
+        await db.commit()
+        raise HTTPException(409, f"Device {data.device_id} heartbeat is stale (no heartbeat for >2 minutes). Cannot send command.")
+    
+    # Check if device is online
     if device.status != "online":
         raise HTTPException(409, f"Device {data.device_id} is offline. Cannot send command.")
     
