@@ -53,15 +53,16 @@ class AttendanceLogResponse(BaseModel):
     finger_id: int
     device_id: str
     record_type: str
-
-    # ✅ NEW (important)
     user_id: Optional[int] = None
     employee_code: Optional[str] = None
-
-    # existing
     user_name: Optional[str] = "Unknown"
-
-
+    
+    # ✅ NEW FIELDS
+    hours_worked: Optional[float] = None
+    met_min_hours: Optional[bool] = None
+    working_hours_status: Optional[str] = None
+    is_late: Optional[bool] = None
+    late_status_message: Optional[str] = None
 # =========================
 # COMMANDS
 # =========================
@@ -109,15 +110,17 @@ class NotificationResponse(BaseModel):
     is_read: bool
     created_at: datetime.datetime
 
+
 class SettingsResponse(BaseModel):
     office_start_time: str
     office_end_time: str
     late_threshold_minutes: int
     working_days: str
-
+    min_working_hours: int  # ✅ NEW
 
 class SettingsUpdateRequest(BaseModel):
     office_start_time: Optional[str] = "09:00:00"
     office_end_time: Optional[str] = "18:00:00"
     late_threshold_minutes: Optional[int] = 15
     working_days: Optional[str] = "1,2,3,4,5"
+    min_working_hours: Optional[int] = 9  # ✅ NEW

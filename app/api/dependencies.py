@@ -12,7 +12,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Security Schemes
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=True)
+
+# ✅ ADD THIS - Optional version (doesn't raise error automatically)
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 # =================================================================
 # 1. CORE IDENTITY DEPENDENCIES
@@ -75,6 +78,40 @@ async def get_current_active_identity(
 # =================================================================
 # 2. ROLE-BASED ACCESS CONTROL (RBAC)
 # =================================================================
+
+async def get_current_tenant(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> Tenant:
+    """
+    Get current tenant from JWT token.
+    Used for tenant endpoints that require JWT auth.
+    """
+    payload = decode_token(token)
+    
+    if not payload:
+        raise HTTPException(401, "Invalid or expired token")
+    
+    if payload.get("type") != "access":
+        raise HTTPException(401, "Invalid token type")
+    
+    # Verify this is a tenant token
+    if payload.get("role") != "tenant_admin":
+        raise HTTPException(403, "Tenant access required")
+    
+    tenant_id = payload.get("tenant_id")
+    
+    if not tenant_id:
+        raise HTTPException(401, "Invalid token payload")
+    
+    # Fetch tenant from database
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant = result.scalars().first()
+    
+    if not tenant:
+        raise HTTPException(401, "Tenant not found")
+    
+    return tenant
 
 def require_role(*allowed_roles: str):
     """Generic role requirement decorator"""

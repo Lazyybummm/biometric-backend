@@ -55,13 +55,13 @@ async def create_attendance_notifications_bg(
 @router.post("/mark")
 async def mark_attendance(
     finger_id: int,
-    background_tasks: BackgroundTasks,  # ← ADDED
+    background_tasks: BackgroundTasks,
     device = Depends(verify_device),
     db: AsyncSession = Depends(get_db)
 ):
     tenant_id = device.tenant_id
 
-    log, user_name = await process_attendance(
+    log, user_name, is_late, late_message = await process_attendance(
         tenant_id,
         device.device_id,
         finger_id,
@@ -71,8 +71,6 @@ async def mark_attendance(
     # Schedule notifications in BACKGROUND
     if log.user_id:
         punch_time = log.timestamp.strftime("%H:%M")
-        is_late = (log.record_type == "IN" and 
-                   log.timestamp.time() > log.timestamp.replace(hour=9, minute=15, second=0).time())
         
         background_tasks.add_task(
             create_attendance_notifications_bg,
@@ -91,6 +89,8 @@ async def mark_attendance(
         "finger_id": log.finger_id,
         "record_type": log.record_type,
         "user_name": user_name,
+        "is_late": is_late,
+        "late_message": late_message,
         "message": f"Successfully marked {log.record_type}"
     }
 

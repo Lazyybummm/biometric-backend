@@ -207,6 +207,7 @@ class Settings(Base):
     office_end_time = Column(String, default="18:00:00")
     late_threshold_minutes = Column(Integer, default=15)
     working_days = Column(String, default="1,2,3,4,5")
+    min_working_hours = Column(Integer, default=9)  # ✅ NEW - Minimum hours required per day
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
