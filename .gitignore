@@ -88,4 +88,9 @@ coverage.xml
 # Misc
 # ----------------------
 *.tmp
-*.temp
+*.tempcheck.py
+combined_project_code.txt
+combined_project_code_*.txt
+check.py
+combined_project_code.txt
+combined_project_code_*.txt

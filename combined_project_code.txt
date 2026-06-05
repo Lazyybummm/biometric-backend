@@ -512,7 +512,9 @@ class Settings(Base):
     office_end_time = Column(String, default="18:00:00")
     late_threshold_minutes = Column(Integer, default=15)
     working_days = Column(String, default="1,2,3,4,5")
+    min_working_hours = Column(Integer, default=9)  # ✅ NEW - Minimum hours required per day
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
 
 # =========================
 # NOTIFICATIONS
@@ -546,6 +548,60 @@ class Notification(Base):
     read_at = Column(DateTime(timezone=True), nullable=True)
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# =========================
+# LEAVE BALANCES (ADD THESE)
+# =========================
+
+class LeaveBalance(Base):
+    __tablename__ = "leave_balances"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    leave_type = Column(String, nullable=False)  # 'sick', 'casual', 'earned'
+    total_quota = Column(Integer, default=0)
+    used_quota = Column(Integer, default=0)
+    remaining_quota = Column(Integer, default=0)
+    year = Column(Integer, nullable=False)
+    last_updated = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'user_id', 'leave_type', 'year', name='uix_user_leave_balance_year'),
+        Index('ix_tenant_user_balance', 'tenant_id', 'user_id', 'year'),
+    )
+
+
+class LeaveSettings(Base):
+    __tablename__ = "leave_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, unique=True)
+    sick_leave_quota = Column(Integer, default=12)
+    casual_leave_quota = Column(Integer, default=12)
+    earned_leave_quota = Column(Integer, default=15)
+    reset_frequency = Column(String, default="yearly")  # 'yearly', 'monthly', 'never'
+    carry_forward_limit = Column(Integer, default=0)
+    auto_approve_limit = Column(Integer, default=0)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+
+class LeaveBalanceHistory(Base):
+    __tablename__ = "leave_balance_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    leave_type = Column(String, nullable=False)
+    previous_balance = Column(Integer, default=0)
+    new_balance = Column(Integer, default=0)
+    adjustment = Column(Integer, default=0)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 ================================================================================
 FILE: schemas/schemas.py
@@ -606,15 +662,16 @@ class AttendanceLogResponse(BaseModel):
     finger_id: int
     device_id: str
     record_type: str
-
-    # ✅ NEW (important)
     user_id: Optional[int] = None
     employee_code: Optional[str] = None
-
-    # existing
     user_name: Optional[str] = "Unknown"
-
-
+    
+    # ✅ NEW FIELDS
+    hours_worked: Optional[float] = None
+    met_min_hours: Optional[bool] = None
+    working_hours_status: Optional[str] = None
+    is_late: Optional[bool] = None
+    late_status_message: Optional[str] = None
 # =========================
 # COMMANDS
 # =========================
@@ -662,19 +719,20 @@ class NotificationResponse(BaseModel):
     is_read: bool
     created_at: datetime.datetime
 
+
 class SettingsResponse(BaseModel):
     office_start_time: str
     office_end_time: str
     late_threshold_minutes: int
     working_days: str
-
+    min_working_hours: int  # ✅ NEW
 
 class SettingsUpdateRequest(BaseModel):
     office_start_time: Optional[str] = "09:00:00"
     office_end_time: Optional[str] = "18:00:00"
     late_threshold_minutes: Optional[int] = 15
     working_days: Optional[str] = "1,2,3,4,5"
-
+    min_working_hours: Optional[int] = 9  # ✅ NEW
 
 ================================================================================
 FILE: db/session.py
@@ -722,15 +780,24 @@ from app.core.security import decode_token
 import datetime
 import logging
 
+# Configure logger for authentication tracking
 logger = logging.getLogger(__name__)
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+# Security Schemes
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=True)
 
+# ✅ ADD THIS - Optional version (doesn't raise error automatically)
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
+
+# =================================================================
+# 1. CORE IDENTITY DEPENDENCIES
+# =================================================================
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db)
 ) -> User:
+    """Standard JWT User retrieval"""
     payload = decode_token(token)
     if not payload or payload.get("type") != "access":
         raise HTTPException(401, "Invalid or expired token")
@@ -744,48 +811,123 @@ async def get_current_user(
     
     return user
 
+async def get_current_active_identity(
+    token: str = Depends(oauth2_scheme),
+    x_api_key: str = Header(None, alias="X-API-Key"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    POLYMORPHIC IDENTITY:
+    Allows shared routes (like notifications) to be accessed by either 
+    an Employee (via JWT) or a Tenant Admin (via API Key).
+    """
+    # 1. Check for JWT (Frontend UI Users)
+    if token:
+        try:
+            payload = decode_token(token)
+            if payload and payload.get("type") == "access":
+                user_id = payload.get("user_id")
+                result = await db.execute(select(User).where(User.id == user_id))
+                user = result.scalars().first()
+                if user and user.is_active:
+                    return user
+        except Exception as e:
+            logger.debug(f"JWT check bypassed/failed: {e}")
+
+    # 2. Check for API Key (Tenant Managers / Direct API hits)
+    if x_api_key:
+        result = await db.execute(select(Tenant).where(Tenant.api_key == x_api_key))
+        tenant = result.scalars().first()
+        if tenant:
+            return tenant
+
+    # 3. Fallback
+    raise HTTPException(
+        status_code=401, 
+        detail="Valid authentication (JWT or API Key) required for this resource"
+    )
+
+# =================================================================
+# 2. ROLE-BASED ACCESS CONTROL (RBAC)
+# =================================================================
+
+async def get_current_tenant(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> Tenant:
+    """
+    Get current tenant from JWT token.
+    Used for tenant endpoints that require JWT auth.
+    """
+    payload = decode_token(token)
+    
+    if not payload:
+        raise HTTPException(401, "Invalid or expired token")
+    
+    if payload.get("type") != "access":
+        raise HTTPException(401, "Invalid token type")
+    
+    # Verify this is a tenant token
+    if payload.get("role") != "tenant_admin":
+        raise HTTPException(403, "Tenant access required")
+    
+    tenant_id = payload.get("tenant_id")
+    
+    if not tenant_id:
+        raise HTTPException(401, "Invalid token payload")
+    
+    # Fetch tenant from database
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant = result.scalars().first()
+    
+    if not tenant:
+        raise HTTPException(401, "Tenant not found")
+    
+    return tenant
 
 def require_role(*allowed_roles: str):
+    """Generic role requirement decorator"""
     async def checker(current_user: User = Depends(get_current_user)):
         if current_user.role not in allowed_roles:
             raise HTTPException(403, f"Requires one of: {allowed_roles}")
         return current_user
     return checker
 
-
 async def require_super_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != "super_admin":
         raise HTTPException(403, "Only super admin can access this")
     return current_user
-
 
 async def require_org_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != "org_admin":
         raise HTTPException(403, "Only org admin can access this")
     return current_user
 
-
 async def require_employee(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != "employee":
         raise HTTPException(403, "Only employees can access this")
     return current_user
 
+# =================================================================
+# 3. TENANT & ORGANIZATION VALIDATION
+# =================================================================
 
 async def verify_tenant_api_key(
     x_api_key: str = Header(..., alias="X-API-Key"),
     db: AsyncSession = Depends(get_db)
 ) -> Tenant:
+    """Strictly validates via Header API Key"""
     result = await db.execute(select(Tenant).where(Tenant.api_key == x_api_key))
     tenant = result.scalars().first()
     if not tenant:
         raise HTTPException(401, "Invalid API key")
     return tenant
 
-
 async def verify_tenant_jwt(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Tenant:
+    """Validates that a logged-in user is a tenant admin and returns the tenant object"""
     if current_user.role != "tenant_admin":
         raise HTTPException(403, "Tenant access required")
     result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
@@ -794,25 +936,35 @@ async def verify_tenant_jwt(
         raise HTTPException(401, "Tenant not found")
     return tenant
 
+# =================================================================
+# 4. HARDWARE / DEVICE VALIDATION
+# =================================================================
 
 async def verify_device(
     x_device_id: str = Header(..., alias="x-device-id"),
     x_secret_key: str = Header(..., alias="x-secret-key"),
     db: AsyncSession = Depends(get_db)
 ):
+    """Biometric Attendance System: Validates physical hardware devices"""
     result = await db.execute(
         select(Device).where(Device.device_id == x_device_id, Device.secret_key == x_secret_key)
     )
     device = result.scalars().first()
     if not device:
         raise HTTPException(401, "Invalid Device Credentials")
+    
+    # Update device heartbeat
     device.last_seen = datetime.datetime.utcnow()
     device.status = "online"
     await db.commit()
     return device
 
+# =================================================================
+# 5. COMPATIBILITY WRAPPERS
+# =================================================================
 
 async def get_admin_data(current_user: User = Depends(require_super_admin)):
+    """Legacy compatibility for older frontend structures"""
     class CompatibleAdmin:
         def __init__(self, user):
             self.id = user.id
@@ -1353,13 +1505,13 @@ async def create_attendance_notifications_bg(
 @router.post("/mark")
 async def mark_attendance(
     finger_id: int,
-    background_tasks: BackgroundTasks,  # ← ADDED
+    background_tasks: BackgroundTasks,
     device = Depends(verify_device),
     db: AsyncSession = Depends(get_db)
 ):
     tenant_id = device.tenant_id
 
-    log, user_name = await process_attendance(
+    log, user_name, is_late, late_message = await process_attendance(
         tenant_id,
         device.device_id,
         finger_id,
@@ -1369,8 +1521,6 @@ async def mark_attendance(
     # Schedule notifications in BACKGROUND
     if log.user_id:
         punch_time = log.timestamp.strftime("%H:%M")
-        is_late = (log.record_type == "IN" and 
-                   log.timestamp.time() > log.timestamp.replace(hour=9, minute=15, second=0).time())
         
         background_tasks.add_task(
             create_attendance_notifications_bg,
@@ -1389,6 +1539,8 @@ async def mark_attendance(
         "finger_id": log.finger_id,
         "record_type": log.record_type,
         "user_name": user_name,
+        "is_late": is_late,
+        "late_message": late_message,
         "message": f"Successfully marked {log.record_type}"
     }
 
@@ -1416,63 +1568,51 @@ async def attendance_history(
 FILE: api/routes/tenant/attendance.py
 ================================================================================
 
-from fastapi import APIRouter, Depends, HTTPException
+"""
+Tenant Attendance Routes
+"""
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
-from datetime import date
-from typing import Optional
+from datetime import date, datetime
+from typing import Optional, List
+from pydantic import BaseModel
+
 from app.db.session import get_db
 from app.api.dependencies import verify_tenant_api_key
 from app.models.domain import Tenant
+from app.services.attendance_service import get_today_summary, get_attendance_history
+from app.services.tenant_settings_service import get_tenant_settings, calculate_valid_working_hours, calculate_late_status
 
 router = APIRouter()
 
 
-@router.get("/attendance/today")
-async def today_attendance(
-    dept_id: Optional[int] = None,
+class EmployeeAttendanceResponse(BaseModel):
+    id: int
+    name: str
+    employee_code: Optional[str]
+    department_name: Optional[str]
+    check_in: Optional[datetime]
+    check_out: Optional[datetime]
+    hours_worked: float
+    met_min_hours: bool
+    is_late: bool
+
+
+class AttendanceSummaryResponse(BaseModel):
+    date: date
+    summary: dict
+    employees: List[EmployeeAttendanceResponse]
+
+
+@router.get("/attendance/today", response_model=AttendanceSummaryResponse)
+async def get_today_attendance(
+    dept_id: Optional[int] = Query(None, description="Filter by department ID"),
     tenant: Tenant = Depends(verify_tenant_api_key),
     db: AsyncSession = Depends(get_db)
 ):
-    """Tenant Manager: View today's attendance"""
-    
-    query = """
-        SELECT 
-            u.id,
-            u.name,
-            u.employee_code,
-            d.department_name,
-            MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
-            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out,
-            CASE 
-                WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') IS NOT NULL 
-                THEN 'present' 
-                ELSE 'absent' 
-            END as status,
-            CASE 
-                WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN')::time > '09:15:00'
-                THEN 'late'
-                ELSE 'on_time'
-            END as punctuality
-        FROM users u
-        LEFT JOIN departments d ON u.dept_id = d.department_id
-        LEFT JOIN attendance_logs a ON u.id = a.user_id 
-            AND DATE(a.timestamp) = CURRENT_DATE
-        WHERE u.tenant_id = :tenant_id
-        AND u.role = 'employee'
-        AND u.is_active = true
-    """
-    
-    params = {"tenant_id": tenant.id}
-    
-    if dept_id:
-        query += " AND u.dept_id = :dept_id"
-        params["dept_id"] = dept_id
-    
-    query += " GROUP BY u.id, d.department_name ORDER BY u.name"
-    
-    result = await db.execute(text(query), params)
-    return result.mappings().all()
+    """Tenant Manager: Get today's attendance with working hours compliance"""
+    result = await get_today_summary(tenant.id, db, dept_id)
+    return result
 
 
 @router.get("/attendance/date/{attendance_date}")
@@ -1482,21 +1622,20 @@ async def attendance_by_date(
     tenant: Tenant = Depends(verify_tenant_api_key),
     db: AsyncSession = Depends(get_db)
 ):
-    """Tenant Manager: View attendance for a specific date"""
+    """Tenant Manager: Get attendance for a specific date with working hours"""
+    
+    from sqlalchemy import text
+    
+    settings = await get_tenant_settings(tenant.id, db)
     
     query = """
         SELECT 
-            u.id,
-            u.name,
+            u.id as user_id,
+            u.name as user_name,
             u.employee_code,
             d.department_name,
-            MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
-            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out,
-            CASE 
-                WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') IS NOT NULL 
-                THEN 'present' 
-                ELSE 'absent' 
-            END as status
+            MIN(CASE WHEN a.record_type = 'IN' THEN a.timestamp END) as check_in,
+            MAX(CASE WHEN a.record_type = 'OUT' THEN a.timestamp END) as check_out
         FROM users u
         LEFT JOIN departments d ON u.dept_id = d.department_id
         LEFT JOIN attendance_logs a ON u.id = a.user_id 
@@ -1515,109 +1654,99 @@ async def attendance_by_date(
         query += " AND u.dept_id = :dept_id"
         params["dept_id"] = dept_id
     
-    query += " GROUP BY u.id, d.department_name ORDER BY u.name"
+    query += " GROUP BY u.id, u.name, u.employee_code, d.department_name ORDER BY u.name"
     
     result = await db.execute(text(query), params)
-    return result.mappings().all()
-
-
-@router.get("/attendance/summary")
-async def attendance_summary(
-    month: int,
-    year: int,
-    dept_id: Optional[int] = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
-    db: AsyncSession = Depends(get_db)
-):
-    """Tenant Manager: Get monthly attendance summary"""
+    rows = result.mappings().all()
     
-    query = """
-        SELECT 
-            u.id,
-            u.name,
-            u.employee_code,
-            d.department_name,
-            COUNT(DISTINCT DATE(a.timestamp)) FILTER (WHERE a.record_type = 'IN') as days_present,
-            COUNT(DISTINCT DATE(a.timestamp)) FILTER (
-                WHERE a.record_type = 'IN' 
-                AND EXTRACT(HOUR FROM a.timestamp) >= 9 
-                AND EXTRACT(MINUTE FROM a.timestamp) > 15
-            ) as days_late,
-            COUNT(DISTINCT DATE(a.timestamp)) FILTER (WHERE a.record_type = 'IN') as total_days
-        FROM users u
-        LEFT JOIN departments d ON u.dept_id = d.department_id
-        LEFT JOIN attendance_logs a ON u.id = a.user_id 
-            AND EXTRACT(MONTH FROM a.timestamp) = :month
-            AND EXTRACT(YEAR FROM a.timestamp) = :year
-        WHERE u.tenant_id = :tenant_id
-        AND u.role = 'employee'
-        AND u.is_active = true
-    """
-    
-    params = {
-        "tenant_id": tenant.id,
-        "month": month,
-        "year": year
-    }
-    
-    if dept_id:
-        query += " AND u.dept_id = :dept_id"
-        params["dept_id"] = dept_id
-    
-    query += " GROUP BY u.id, d.department_name ORDER BY u.name"
-    
-    result = await db.execute(text(query), params)
-    return result.mappings().all()
-
-
-@router.get("/attendance/stats")
-async def attendance_statistics(
-    month: Optional[int] = None,
-    year: Optional[int] = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
-    db: AsyncSession = Depends(get_db)
-):
-    """Tenant Manager: Get overall attendance statistics"""
-    
-    if not month or not year:
-        month = date.today().month
-        year = date.today().year
-    
-    result = await db.execute(text("""
-        WITH daily_stats AS (
-            SELECT 
-                DATE(timestamp) as day,
-                COUNT(DISTINCT user_id) as present_count,
-                COUNT(DISTINCT user_id) FILTER (
-                    WHERE timestamp::time <= '09:15:00'
-                ) as on_time_count
-            FROM attendance_logs
-            WHERE tenant_id = :tenant_id
-            AND record_type = 'IN'
-            AND EXTRACT(MONTH FROM timestamp) = :month
-            AND EXTRACT(YEAR FROM timestamp) = :year
-            GROUP BY DATE(timestamp)
+    enriched_rows = []
+    for row in rows:
+        valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
+            row["check_in"],
+            row["check_out"],
+            settings
         )
-        SELECT 
-            COUNT(DISTINCT day) as total_working_days,
-            AVG(present_count) as avg_daily_present,
-            AVG(on_time_count) as avg_daily_on_time,
-            MAX(present_count) as max_present,
-            MIN(present_count) as min_present
-        FROM daily_stats
-    """), {
-        "tenant_id": tenant.id,
-        "month": month,
-        "year": year
-    })
+        
+        is_late = False
+        if row["check_in"]:
+            is_late, _ = calculate_late_status(row["check_in"], settings)
+        
+        enriched_rows.append({
+            "id": row["user_id"],
+            "name": row["user_name"],
+            "employee_code": row["employee_code"],
+            "department_name": row["department_name"],
+            "check_in": row["check_in"],
+            "check_out": row["check_out"],
+            "hours_worked": round(valid_hours, 2),
+            "actual_duration": round(actual_duration, 2),
+            "lost_hours": round(lost_hours, 2),
+            "met_min_hours": met_min_hours,
+            "is_late": is_late,
+            "status_message": status_msg,
+            "status": "present" if row["check_in"] else "absent"
+        })
     
-    return result.mappings().first()
+    total = len(enriched_rows)
+    present = len([r for r in enriched_rows if r["check_in"]])
+    late = len([r for r in enriched_rows if r["is_late"]])
+    met_min = len([r for r in enriched_rows if r["met_min_hours"]])
+    total_valid_hours = sum([r["hours_worked"] for r in enriched_rows])
+    total_lost_hours = sum([r["lost_hours"] for r in enriched_rows])
+    
+    return {
+        "date": attendance_date,
+        "summary": {
+            "total_employees": total,
+            "present": present,
+            "absent": total - present,
+            "late_checkins": late,
+            "on_time_checkins": present - late,
+            "met_minimum_hours": met_min,
+            "attendance_rate": round((present / total * 100), 1) if total > 0 else 0,
+            "compliance_rate": round((met_min / present * 100), 1) if present > 0 else 0,
+            "total_valid_hours": round(total_valid_hours, 1),
+            "total_lost_hours": round(total_lost_hours, 1)
+        },
+        "employees": enriched_rows
+    }
+
+
+@router.get("/attendance/settings")
+async def get_attendance_settings(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get attendance-related settings for the tenant"""
+    
+    settings = await get_tenant_settings(tenant.id, db)
+    
+    return {
+        "office_start_time": settings["office_start_time"],
+        "office_start": settings["office_start"].strftime("%H:%M"),
+        "office_end_time": settings["office_end_time"],
+        "office_end": settings["office_end"].strftime("%H:%M"),
+        "late_threshold_minutes": settings["late_threshold_minutes"],
+        "min_working_hours": settings["min_working_hours"],
+        "working_days": settings["working_days"]
+    }
 
 ================================================================================
 FILE: api/routes/tenant/__init__.py
 ================================================================================
 
-
+from app.api.routes.tenant import (
+    dashboard,
+    departments,
+    employees,
+    attendance,
+    leaves,
+    holidays,
+    devices,  # ✅ Make sure this is included
+    org_admins,
+    reports,
+    settings
+)
 
 ================================================================================
 FILE: api/routes/tenant/org_admins.py
@@ -1932,11 +2061,12 @@ FILE: api/routes/tenant/leaves.py
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy import text, select
 from typing import Optional
+from datetime import datetime
 from app.db.session import get_db
 from app.api.dependencies import verify_tenant_api_key
-from app.models.domain import Tenant
+from app.models.domain import Tenant, LeaveBalance, LeaveSettings
 from app.services.notification_service import notify_single_user
 
 router = APIRouter()
@@ -2006,6 +2136,28 @@ async def approve_leave(
     if not info:
         raise HTTPException(404, "Leave request not found")
     
+    # Calculate days requested
+    days_requested = (info["end_date"] - info["start_date"]).days + 1
+    
+    # Check leave balance
+    current_year = datetime.now().year
+    balance_result = await db.execute(
+        select(LeaveBalance).where(
+            LeaveBalance.tenant_id == tenant.id,
+            LeaveBalance.user_id == info["employee_id"],
+            LeaveBalance.leave_type == info["leave_type"],
+            LeaveBalance.year == current_year
+        )
+    )
+    balance = balance_result.scalars().first()
+    
+    if not balance:
+        raise HTTPException(400, f"No leave balance found for {info['leave_type']} leave. Please contact admin.")
+    
+    if balance.remaining_quota < days_requested:
+        raise HTTPException(400, f"Insufficient {info['leave_type']} leave balance. Available: {balance.remaining_quota}, Requested: {days_requested}")
+    
+    # Update leave status
     result = await db.execute(text("""
         UPDATE leaves
         SET status = 'approved', approved_at = NOW(), approved_by = :tenant_id
@@ -2015,6 +2167,24 @@ async def approve_leave(
     
     if result.rowcount == 0:
         raise HTTPException(404, "Leave request not found or cannot be approved")
+    
+    # Deduct from balance
+    await db.execute(text("""
+        UPDATE leave_balances
+        SET used_quota = used_quota + :days,
+            remaining_quota = remaining_quota - :days,
+            last_updated = NOW()
+        WHERE tenant_id = :tenant_id 
+        AND user_id = :user_id 
+        AND leave_type = :leave_type 
+        AND year = :year
+    """), {
+        "days": days_requested,
+        "tenant_id": tenant.id,
+        "user_id": info["employee_id"],
+        "leave_type": info["leave_type"],
+        "year": current_year
+    })
     
     await db.commit()
     
@@ -2100,6 +2270,261 @@ async def leave_statistics(
         WHERE tenant_id = :tenant_id
     """), {"tenant_id": tenant.id})
     return result.mappings().first()
+
+
+# =========================
+# LEAVE BALANCE ENDPOINTS (TENANT)
+# =========================
+
+@router.get("/leave-balances")
+async def get_leave_balances(
+    year: Optional[int] = None,
+    department_id: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all leave balances for tenant"""
+    
+    if not year:
+        year = datetime.now().year
+    
+    query = """
+        SELECT 
+            lb.id,
+            lb.user_id,
+            u.name as user_name,
+            u.employee_code,
+            lb.leave_type,
+            lb.total_quota,
+            lb.used_quota,
+            lb.remaining_quota,
+            lb.year,
+            d.department_name
+        FROM leave_balances lb
+        JOIN users u ON lb.user_id = u.id
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        WHERE lb.tenant_id = :tenant_id AND lb.year = :year
+    """
+    
+    params = {"tenant_id": tenant.id, "year": year}
+    
+    if department_id:
+        query += " AND u.dept_id = :dept_id"
+        params["dept_id"] = department_id
+    
+    query += " ORDER BY u.name"
+    
+    result = await db.execute(text(query), params)
+    balances = result.mappings().all()
+    
+    return balances
+
+
+@router.get("/leave-balances/settings")
+async def get_leave_settings(
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get leave settings for tenant"""
+    
+    result = await db.execute(
+        select(LeaveSettings).where(LeaveSettings.tenant_id == tenant.id)
+    )
+    settings = result.scalars().first()
+    
+    if not settings:
+        # Create default settings
+        settings = LeaveSettings(
+            tenant_id=tenant.id,
+            sick_leave_quota=12,
+            casual_leave_quota=12,
+            earned_leave_quota=15,
+            reset_frequency="yearly",
+            carry_forward_limit=0,
+            auto_approve_limit=0
+        )
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+    
+    return {
+        "sick_leave_quota": settings.sick_leave_quota,
+        "casual_leave_quota": settings.casual_leave_quota,
+        "earned_leave_quota": settings.earned_leave_quota,
+        "reset_frequency": settings.reset_frequency,
+        "carry_forward_limit": settings.carry_forward_limit,
+        "auto_approve_limit": settings.auto_approve_limit
+    }
+
+
+@router.put("/leave-balances/settings")
+async def update_leave_settings(
+    data: dict,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update leave settings for tenant"""
+    
+    result = await db.execute(
+        select(LeaveSettings).where(LeaveSettings.tenant_id == tenant.id)
+    )
+    settings = result.scalars().first()
+    
+    if not settings:
+        settings = LeaveSettings(tenant_id=tenant.id)
+        db.add(settings)
+    
+    if "sick_leave_quota" in data:
+        settings.sick_leave_quota = data["sick_leave_quota"]
+    if "casual_leave_quota" in data:
+        settings.casual_leave_quota = data["casual_leave_quota"]
+    if "earned_leave_quota" in data:
+        settings.earned_leave_quota = data["earned_leave_quota"]
+    if "reset_frequency" in data:
+        settings.reset_frequency = data["reset_frequency"]
+    if "carry_forward_limit" in data:
+        settings.carry_forward_limit = data["carry_forward_limit"]
+    if "auto_approve_limit" in data:
+        settings.auto_approve_limit = data["auto_approve_limit"]
+    
+    settings.updated_at = datetime.now()
+    
+    await db.commit()
+    await db.refresh(settings)
+    
+    return {"message": "Leave settings updated successfully"}
+
+
+@router.post("/leave-balances/update")
+async def update_leave_balance(
+    data: dict,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update leave balance for a user"""
+    
+    year = datetime.now().year
+    
+    # Check if balance exists
+    result = await db.execute(
+        select(LeaveBalance).where(
+            LeaveBalance.tenant_id == tenant.id,
+            LeaveBalance.user_id == data["user_id"],
+            LeaveBalance.leave_type == data["leave_type"],
+            LeaveBalance.year == year
+        )
+    )
+    balance = result.scalars().first()
+    
+    if balance:
+        old_total = balance.total_quota
+        balance.total_quota = data["total_quota"]
+        balance.remaining_quota = data["total_quota"] - balance.used_quota
+        balance.last_updated = datetime.now()
+    else:
+        balance = LeaveBalance(
+            tenant_id=tenant.id,
+            user_id=data["user_id"],
+            leave_type=data["leave_type"],
+            total_quota=data["total_quota"],
+            used_quota=0,
+            remaining_quota=data["total_quota"],
+            year=year
+        )
+        db.add(balance)
+    
+    await db.commit()
+    
+    return {"message": f"Leave balance updated for {data['leave_type']} leave"}
+
+
+@router.post("/leave-balances/reset-year")
+async def reset_leave_balances(
+    year: int,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Reset leave balances for all users for a specific year"""
+    
+    # Get settings
+    settings_result = await db.execute(
+        select(LeaveSettings).where(LeaveSettings.tenant_id == tenant.id)
+    )
+    settings = settings_result.scalars().first()
+    
+    if not settings:
+        raise HTTPException(400, "Leave settings not configured")
+    
+    # Get all active users
+    users_result = await db.execute(text("""
+        SELECT id FROM users 
+        WHERE tenant_id = :tenant_id AND is_active = True
+    """), {"tenant_id": tenant.id})
+    users = users_result.fetchall()
+    
+    # Create balances for each user
+    for user in users:
+        for leave_type, quota in [
+            ('sick', settings.sick_leave_quota),
+            ('casual', settings.casual_leave_quota),
+            ('earned', settings.earned_leave_quota)
+        ]:
+            # Check if balance already exists
+            existing = await db.execute(
+                select(LeaveBalance).where(
+                    LeaveBalance.tenant_id == tenant.id,
+                    LeaveBalance.user_id == user.id,
+                    LeaveBalance.leave_type == leave_type,
+                    LeaveBalance.year == year
+                )
+            )
+            if not existing.scalars().first():
+                balance = LeaveBalance(
+                    tenant_id=tenant.id,
+                    user_id=user.id,
+                    leave_type=leave_type,
+                    total_quota=quota,
+                    used_quota=0,
+                    remaining_quota=quota,
+                    year=year
+                )
+                db.add(balance)
+    
+    await db.commit()
+    
+    return {"message": f"Leave balances reset for year {year}"}
+
+
+@router.get("/leave-balances/users/{user_id}")
+async def get_user_leave_balance(
+    user_id: int,
+    year: Optional[int] = None,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get leave balance for a specific user"""
+    
+    if not year:
+        year = datetime.now().year
+    
+    result = await db.execute(
+        select(LeaveBalance).where(
+            LeaveBalance.tenant_id == tenant.id,
+            LeaveBalance.user_id == user_id,
+            LeaveBalance.year == year
+        )
+    )
+    balances = result.scalars().all()
+    
+    return [
+        {
+            "leave_type": b.leave_type,
+            "total_quota": b.total_quota,
+            "used_quota": b.used_quota,
+            "remaining_quota": b.remaining_quota
+        }
+        for b in balances
+    ]
 
 ================================================================================
 FILE: api/routes/tenant/reports.py
@@ -2233,15 +2658,23 @@ async def export_report(
 FILE: api/routes/tenant/settings.py
 ================================================================================
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from pydantic import BaseModel
+from sqlalchemy.future import select
+from pydantic import BaseModel, field_validator
+from typing import Optional
+import re
+import logging
+from datetime import datetime
+
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import verify_tenant_api_key, oauth2_scheme_optional
 from app.models.domain import Tenant
+from app.core.security import decode_token
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # =========================
@@ -2252,39 +2685,192 @@ class SettingsUpdate(BaseModel):
     office_start_time: str = "09:00:00"
     office_end_time: str = "18:00:00"
     late_threshold_minutes: int = 15
-    working_days: str = "1,2,3,4,5"  # Mon-Fri
+    working_days: str = "1,2,3,4,5"
+    min_working_hours: float = 9.0  # ✅ NEW - Minimum working hours per day
+
+    @field_validator('office_start_time', 'office_end_time')
+    @classmethod
+    def validate_time_format(cls, v: str) -> str:
+        """Validate time format HH:MM:SS"""
+        pattern = r'^([0-1][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$'
+        if not re.match(pattern, v):
+            raise ValueError(f'Invalid time format: {v}. Use HH:MM:SS')
+        return v
+
+    @field_validator('late_threshold_minutes')
+    @classmethod
+    def validate_threshold(cls, v: int) -> int:
+        if v < 0 or v > 120:
+            raise ValueError('Late threshold must be between 0 and 120 minutes')
+        return v
+
+    @field_validator('min_working_hours')
+    @classmethod
+    def validate_min_hours(cls, v: float) -> float:
+        if v < 0.5 or v > 24:
+            raise ValueError('Minimum working hours must be between 0.5 and 24 hours')
+        return v
+
+    @field_validator('working_days')
+    @classmethod
+    def validate_working_days(cls, v: str) -> str:
+        """Validate working days format: comma-separated numbers 1-7"""
+        if not v:
+            return "1,2,3,4,5"
+        days = v.split(',')
+        for day in days:
+            if not day.strip().isdigit() or int(day) < 1 or int(day) > 7:
+                raise ValueError(f'Invalid working day: {day}. Must be 1-7')
+        return v
+
+
+class ChangeApiKeyRequest(BaseModel):
+    """Change API key request - password-like validation"""
+    api_key: str
+    
+    @field_validator('api_key')
+    @classmethod
+    def validate_api_key(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError('API key must be at least 8 characters')
+        if not re.search(r'[A-Z]', v):
+            raise ValueError('API key must contain at least one uppercase letter')
+        if not re.search(r'[a-z]', v):
+            raise ValueError('API key must contain at least one lowercase letter')
+        if not re.search(r'[0-9]', v):
+            raise ValueError('API key must contain at least one number')
+        return v
+
+
+class SettingsResponse(BaseModel):
+    office_start_time: str
+    office_end_time: str
+    late_threshold_minutes: int
+    working_days: str
+    min_working_hours: float
+    updated_at: Optional[datetime] = None
 
 
 # =========================
-# ROUTES
+# CACHE FOR SETTINGS (In-memory with TTL)
 # =========================
 
-@router.get("/settings")
+_settings_cache = {}
+_cache_ttl = 300  # 5 minutes cache
+
+
+def get_cached_settings(tenant_id: int) -> Optional[dict]:
+    """Get settings from cache if not expired"""
+    cache_key = f"tenant_settings_{tenant_id}"
+    if cache_key in _settings_cache:
+        cached_data, timestamp = _settings_cache[cache_key]
+        if (datetime.now() - timestamp).seconds < _cache_ttl:
+            return cached_data
+        # Cache expired, remove it
+        del _settings_cache[cache_key]
+    return None
+
+
+def set_cached_settings(tenant_id: int, settings: dict):
+    """Store settings in cache"""
+    cache_key = f"tenant_settings_{tenant_id}"
+    _settings_cache[cache_key] = (settings.copy(), datetime.now())
+
+
+def invalidate_settings_cache(tenant_id: int):
+    """Invalidate cache for a tenant"""
+    cache_key = f"tenant_settings_{tenant_id}"
+    if cache_key in _settings_cache:
+        del _settings_cache[cache_key]
+        logger.info(f"Cache invalidated for tenant {tenant_id}")
+
+
+# =========================
+# CORE SETTINGS FUNCTIONS
+# =========================
+
+async def get_tenant_settings_from_db(
+    tenant_id: int, 
+    db: AsyncSession,
+    force_refresh: bool = False
+) -> dict:
+    """
+    Get tenant settings from database with caching
+    """
+    # Check cache first
+    if not force_refresh:
+        cached = get_cached_settings(tenant_id)
+        if cached:
+            return cached
+    
+    # Fetch from database
+    result = await db.execute(text("""
+        SELECT 
+            office_start_time, 
+            office_end_time, 
+            late_threshold_minutes, 
+            working_days,
+            min_working_hours,
+            updated_at
+        FROM settings
+        WHERE tenant_id = :tenant_id
+        LIMIT 1
+    """), {"tenant_id": tenant_id})
+    
+    settings = result.mappings().first()
+    
+    if not settings:
+        # Return defaults if no settings found
+        settings = {
+            "office_start_time": "09:00:00",
+            "office_end_time": "18:00:00",
+            "late_threshold_minutes": 15,
+            "working_days": "1,2,3,4,5",
+            "min_working_hours": 9.0,
+            "updated_at": None
+        }
+    else:
+        # Convert to dict
+        settings = dict(settings)
+        # Ensure min_working_hours exists (for backward compatibility)
+        if settings.get("min_working_hours") is None:
+            settings["min_working_hours"] = 9.0
+    
+    # Parse times for convenience
+    settings["office_start"] = datetime.strptime(
+        settings["office_start_time"], "%H:%M:%S"
+    ).time()
+    settings["office_end"] = datetime.strptime(
+        settings["office_end_time"], "%H:%M:%S"
+    ).time()
+    
+    # Store in cache
+    set_cached_settings(tenant_id, settings)
+    
+    return settings
+
+
+# =========================
+# EXISTING ENDPOINTS (UPDATED)
+# =========================
+
+@router.get("/settings", response_model=SettingsResponse)
 async def get_settings(
     tenant: Tenant = Depends(verify_tenant_api_key),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get organization settings"""
     
-    result = await db.execute(text("""
-        SELECT *
-        FROM settings
-        WHERE tenant_id = :tenant_id
-        LIMIT 1
-    """), {"tenant_id": tenant.id})
+    settings = await get_tenant_settings_from_db(tenant.id, db)
     
-    settings = result.mappings().first()
-    
-    if not settings:
-        # Return defaults
-        return {
-            "office_start_time": "09:00:00",
-            "office_end_time": "18:00:00",
-            "late_threshold_minutes": 15,
-            "working_days": "1,2,3,4,5"
-        }
-    
-    return settings
+    return SettingsResponse(
+        office_start_time=settings["office_start_time"],
+        office_end_time=settings["office_end_time"],
+        late_threshold_minutes=settings["late_threshold_minutes"],
+        working_days=settings["working_days"],
+        min_working_hours=settings["min_working_hours"],
+        updated_at=settings.get("updated_at")
+    )
 
 
 @router.put("/settings")
@@ -2295,26 +2881,65 @@ async def update_settings(
 ):
     """Tenant Manager: Update organization settings"""
     
-    # Upsert settings
-    await db.execute(text("""
-        INSERT INTO settings (tenant_id, office_start_time, office_end_time, late_threshold_minutes, working_days)
-        VALUES (:tenant_id, :office_start_time, :office_end_time, :late_threshold_minutes, :working_days)
-        ON CONFLICT (tenant_id) DO UPDATE SET
-            office_start_time = EXCLUDED.office_start_time,
-            office_end_time = EXCLUDED.office_end_time,
-            late_threshold_minutes = EXCLUDED.late_threshold_minutes,
-            working_days = EXCLUDED.working_days
-    """), {
-        "tenant_id": tenant.id,
-        "office_start_time": data.office_start_time,
-        "office_end_time": data.office_end_time,
-        "late_threshold_minutes": data.late_threshold_minutes,
-        "working_days": data.working_days
-    })
-    
-    await db.commit()
-    
-    return {"message": "Settings updated successfully"}
+    try:
+        # Update settings in database
+        await db.execute(text("""
+            INSERT INTO settings (
+                tenant_id, 
+                office_start_time, 
+                office_end_time, 
+                late_threshold_minutes, 
+                working_days,
+                min_working_hours,
+                updated_at
+            )
+            VALUES (
+                :tenant_id, 
+                :office_start_time, 
+                :office_end_time, 
+                :late_threshold_minutes, 
+                :working_days,
+                :min_working_hours,
+                NOW()
+            )
+            ON CONFLICT (tenant_id) DO UPDATE SET
+                office_start_time = EXCLUDED.office_start_time,
+                office_end_time = EXCLUDED.office_end_time,
+                late_threshold_minutes = EXCLUDED.late_threshold_minutes,
+                working_days = EXCLUDED.working_days,
+                min_working_hours = EXCLUDED.min_working_hours,
+                updated_at = EXCLUDED.updated_at
+        """), {
+            "tenant_id": tenant.id,
+            "office_start_time": data.office_start_time,
+            "office_end_time": data.office_end_time,
+            "late_threshold_minutes": data.late_threshold_minutes,
+            "working_days": data.working_days,
+            "min_working_hours": data.min_working_hours
+        })
+        
+        await db.commit()
+        
+        # Invalidate cache
+        invalidate_settings_cache(tenant.id)
+        
+        logger.info(f"Settings updated for tenant {tenant.id}: min_working_hours={data.min_working_hours}")
+        
+        return {
+            "message": "Settings updated successfully",
+            "settings": {
+                "office_start_time": data.office_start_time,
+                "office_end_time": data.office_end_time,
+                "late_threshold_minutes": data.late_threshold_minutes,
+                "working_days": data.working_days,
+                "min_working_hours": data.min_working_hours
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to update settings for tenant {tenant.id}: {e}")
+        await db.rollback()
+        raise HTTPException(500, f"Failed to update settings: {str(e)}")
 
 
 @router.get("/profile")
@@ -2324,12 +2949,281 @@ async def get_tenant_profile(
 ):
     """Tenant Manager: Get own profile"""
     
+    # Get settings as well
+    settings = await get_tenant_settings_from_db(tenant.id, db)
+    
     return {
         "id": tenant.id,
         "name": tenant.name,
         "api_key": tenant.api_key,
-        "created_at": tenant.created_at
+        "created_at": tenant.created_at,
+        "settings": {
+            "office_start_time": settings["office_start_time"],
+            "office_end_time": settings["office_end_time"],
+            "late_threshold_minutes": settings["late_threshold_minutes"],
+            "working_days": settings["working_days"],
+            "min_working_hours": settings["min_working_hours"]
+        }
     }
+
+
+# =========================
+# PUBLIC SETTINGS ENDPOINT (No Auth Required)
+# =========================
+
+@router.get("/settings/public")
+async def get_public_settings(
+    tenant_id: int = Query(..., description="Tenant ID to fetch settings for"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Public endpoint for frontend to fetch settings without authentication.
+    Used by Org Admin and Employee dashboards to get attendance rules.
+    """
+    try:
+        settings = await get_tenant_settings_from_db(tenant_id, db)
+        
+        # Return only non-sensitive information
+        return {
+            "office_start_time": settings["office_start_time"],
+            "office_end_time": settings["office_end_time"],
+            "late_threshold_minutes": settings["late_threshold_minutes"],
+            "min_working_hours": settings["min_working_hours"],
+            "working_days": settings["working_days"],
+            "office_start": settings["office_start"].strftime("%H:%M"),
+            "office_end": settings["office_end"].strftime("%H:%M")
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch public settings for tenant {tenant_id}: {e}")
+        # Return defaults instead of failing
+        return {
+            "office_start_time": "09:00:00",
+            "office_end_time": "18:00:00",
+            "late_threshold_minutes": 15,
+            "min_working_hours": 9.0,
+            "working_days": "1,2,3,4,5",
+            "office_start": "09:00",
+            "office_end": "18:00"
+        }
+
+
+# =========================
+# BULK SETTINGS ENDPOINT (For multiple tenants - Super Admin only)
+# =========================
+
+@router.get("/settings/bulk")
+async def get_bulk_settings(
+    tenant_ids: str = Query(..., description="Comma-separated tenant IDs"),
+    db: AsyncSession = Depends(get_db),
+    tenant: Tenant = Depends(verify_tenant_api_key)  # Requires tenant admin access
+):
+    """Get settings for multiple tenants (useful for super admin dashboards)"""
+    
+    ids = [int(id.strip()) for id in tenant_ids.split(',')]
+    
+    result = await db.execute(text("""
+        SELECT 
+            tenant_id,
+            office_start_time,
+            office_end_time,
+            late_threshold_minutes,
+            working_days,
+            min_working_hours
+        FROM settings
+        WHERE tenant_id = ANY(:tenant_ids)
+    """), {"tenant_ids": ids})
+    
+    settings_list = result.mappings().all()
+    
+    # Create a map for easy lookup
+    settings_map = {}
+    for setting in settings_list:
+        settings_map[setting["tenant_id"]] = dict(setting)
+    
+    # Fill in defaults for tenants without settings
+    for tenant_id in ids:
+        if tenant_id not in settings_map:
+            settings_map[tenant_id] = {
+                "tenant_id": tenant_id,
+                "office_start_time": "09:00:00",
+                "office_end_time": "18:00:00",
+                "late_threshold_minutes": 15,
+                "working_days": "1,2,3,4,5",
+                "min_working_hours": 9.0
+            }
+    
+    return list(settings_map.values())
+
+
+# =========================
+# SETTINGS VALIDATION ENDPOINT
+# =========================
+
+@router.post("/settings/validate")
+async def validate_settings(
+    data: SettingsUpdate,
+    tenant: Tenant = Depends(verify_tenant_api_key)
+):
+    """Validate settings without saving them"""
+    
+    # All validation is done by Pydantic
+    return {
+        "valid": True,
+        "message": "Settings are valid",
+        "settings": {
+            "office_start_time": data.office_start_time,
+            "office_end_time": data.office_end_time,
+            "late_threshold_minutes": data.late_threshold_minutes,
+            "working_days": data.working_days,
+            "min_working_hours": data.min_working_hours
+        }
+    }
+
+
+# =========================
+# UPDATED CHANGE API KEY ENDPOINT
+# =========================
+
+@router.post("/change-api-key")
+async def change_api_key(
+    data: ChangeApiKeyRequest,
+    x_api_key: str = Header(None, alias="X-API-Key"),
+    token: str = Depends(oauth2_scheme_optional),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Tenant changes own API key.
+    Accepts BOTH:
+    - API Key authentication (X-API-Key header) - for existing API key users
+    - JWT Bearer token authentication - for users logged in via /tenant-login
+    
+    This allows tenants to change their API key regardless of how they authenticated.
+    """
+    
+    try:
+        tenant = None
+        
+        # Method 1: Try API Key from header (X-API-Key)
+        if x_api_key:
+            result = await db.execute(
+                select(Tenant).where(Tenant.api_key == x_api_key)
+            )
+            tenant = result.scalars().first()
+            if tenant:
+                logger.info(f"Tenant authenticated via API key: {tenant.id} ({tenant.name})")
+        
+        # Method 2: Try JWT Bearer token
+        if not tenant and token:
+            payload = decode_token(token)
+            if payload and payload.get("type") == "access":
+                # Verify this is a tenant token
+                if payload.get("role") == "tenant_admin":
+                    tenant_id = payload.get("tenant_id")
+                    if tenant_id:
+                        result = await db.execute(
+                            select(Tenant).where(Tenant.id == tenant_id)
+                        )
+                        tenant = result.scalars().first()
+                        if tenant:
+                            logger.info(f"Tenant authenticated via JWT: {tenant.id} ({tenant.name})")
+        
+        # No valid authentication found
+        if not tenant:
+            logger.warning("Change API key attempt - no valid authentication")
+            raise HTTPException(401, "Unauthorized - Valid API key or JWT token required")
+        
+        # Store old key for logging
+        old_key_preview = tenant.api_key[:8] + "..." if tenant.api_key else "None"
+        
+        # Update API key with the provided value
+        tenant.api_key = data.api_key
+        await db.commit()
+        
+        logger.info(f"API key changed for tenant: {tenant.id} ({tenant.name})")
+        logger.warning(f"Old key: {old_key_preview}, New key: {data.api_key[:8]}...")
+        
+        # Invalidate settings cache (though API key change doesn't affect settings)
+        invalidate_settings_cache(tenant.id)
+        
+        return {
+            "message": "API key changed successfully",
+            "tenant_id": tenant.id,
+            "tenant_name": tenant.name
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Change API key error: {str(e)}")
+        await db.rollback()
+        raise HTTPException(500, "Internal server error")
+
+
+# =========================
+# UTILITY ENDPOINT - Clear Settings Cache (for debugging)
+# =========================
+
+@router.post("/settings/clear-cache")
+async def clear_settings_cache(
+    tenant: Tenant = Depends(verify_tenant_api_key)
+):
+    """Clear cached settings for this tenant (useful for debugging)"""
+    invalidate_settings_cache(tenant.id)
+    return {"message": f"Cache cleared for tenant {tenant.id}"}
+
+
+# =========================
+# SETTINGS HISTORY (Optional - if you want to track changes)
+# =========================
+
+@router.get("/settings/history")
+async def get_settings_history(
+    limit: int = 10,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get settings change history (requires a settings_history table)
+    This is a placeholder - implement if you want to track changes over time
+    """
+    # Note: You'd need to create a settings_history table first
+    # For now, return a message
+    return {
+        "message": "Settings history feature requires additional database table",
+        "suggestion": "Create settings_history table to track changes"
+    }
+
+
+@router.get("/settings/public")
+async def get_public_settings(
+    tenant_id: int = Query(..., description="Tenant ID"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    PUBLIC ENDPOINT - No authentication required.
+    Get tenant settings by tenant_id.
+    Anyone from the same company can access this.
+    """
+    try:
+        from app.services.tenant_settings_service import get_tenant_settings
+        settings = await get_tenant_settings(tenant_id, db)
+        
+        return {
+            "office_start_time": settings["office_start_time"],
+            "office_end_time": settings["office_end_time"],
+            "late_threshold_minutes": settings["late_threshold_minutes"],
+            "min_working_hours": settings["min_working_hours"],
+            "working_days": settings["working_days"]
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch public settings: {e}")
+        return {
+            "office_start_time": "09:00:00",
+            "office_end_time": "18:00:00",
+            "late_threshold_minutes": 15,
+            "min_working_hours": 9.0,
+            "working_days": "1,2,3,4,5"
+        }
 
 ================================================================================
 FILE: api/routes/tenant/employees.py
@@ -2665,23 +3559,283 @@ async def upcoming_holidays(
 FILE: api/routes/tenant/devices.py
 ================================================================================
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import text
-from pydantic import BaseModel
+from sqlalchemy import text, func
+from pydantic import BaseModel, Field
+from typing import Optional, List
+from datetime import datetime, timedelta
 from app.db.session import get_db
 from app.api.dependencies import verify_tenant_api_key
-from app.models.domain import Tenant, Device, Command
+from app.models.domain import Tenant, Device, Command, User
 from app.mqtt.client import mqtt_manager
 
 router = APIRouter()
 
 
+# =========================
+# SCHEMAS
+# =========================
+
+class DeviceCreate(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=100, description="Unique device identifier")
+    secret_key: str = Field(..., min_length=8, description="Secret key for device authentication")
+
+
+class DeviceUpdate(BaseModel):
+    device_id: Optional[str] = Field(None, min_length=1, max_length=100)
+    secret_key: Optional[str] = Field(None, min_length=8)
+
+
 class FireCommandRequest(BaseModel):
     device_id: str
-    command: str
+    command: str  # 'enroll' or 'delete'
     target_id: int = None
+
+
+class DeviceHeartbeatResponse(BaseModel):
+    status: str
+    message: str
+    timestamp: str
+
+
+class DeviceMarkAttendanceResponse(BaseModel):
+    success: bool
+    message: str
+    record_type: str
+    user_name: str
+    finger_id: int
+
+
+# =========================
+# HELPER FUNCTION
+# =========================
+
+async def check_and_update_device_status(device: Device, db: AsyncSession):
+    """Check if device heartbeat is stale and update status accordingly"""
+    if device.status == "online" and device.last_seen:
+        stale_cutoff = datetime.utcnow() - timedelta(minutes=2)
+        if device.last_seen < stale_cutoff:
+            device.status = "offline"
+            await db.commit()
+            return False
+    return device.status == "online"
+
+
+# =========================
+# ESP DEVICE ENDPOINTS (Called by hardware)
+# =========================
+
+@router.post("/device/mark")
+async def device_mark_attendance(
+    finger_id: int,
+    device_id: str = Header(..., alias="x-device-id"),
+    secret_key: str = Header(..., alias="x-secret-key"),
+    db: AsyncSession = Depends(get_db)
+):
+    """ESP Device calls this when fingerprint is detected"""
+    
+    # Verify device exists and credentials are correct
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == device_id,
+            Device.secret_key == secret_key
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(401, "Invalid device credentials")
+    
+    # Update device status to online and update last_seen
+    device.status = "online"
+    device.last_seen = func.now()
+    
+    # Find user by fingerprint ID
+    user_result = await db.execute(
+        select(User).where(
+            User.tenant_id == device.tenant_id,
+            User.finger_id == finger_id,
+            User.is_active == True
+        )
+    )
+    user = user_result.scalars().first()
+    
+    if not user:
+        await db.commit()
+        return {
+            "success": False,
+            "message": "User not found or inactive",
+            "record_type": "DENIED",
+            "user_name": "Unknown",
+            "finger_id": finger_id
+        }
+    
+    # Determine if IN or OUT based on last attendance
+    last_attendance = await db.execute(
+        text("""
+            SELECT record_type, created_at
+            FROM attendance
+            WHERE user_id = :user_id
+            AND DATE(created_at) = CURRENT_DATE
+            ORDER BY created_at DESC
+            LIMIT 1
+        """),
+        {"user_id": user.id}
+    )
+    
+    last_record = last_attendance.mappings().first()
+    
+    # Determine record type
+    if not last_record or last_record["record_type"] == "OUT":
+        record_type = "IN"
+        message = f"Welcome {user.full_name}"
+    else:
+        record_type = "OUT"
+        message = f"Goodbye {user.full_name}"
+    
+    # Create attendance record
+    await db.execute(
+        text("""
+            INSERT INTO attendance (user_id, tenant_id, record_type, device_id, created_at)
+            VALUES (:user_id, :tenant_id, :record_type, :device_id, NOW())
+        """),
+        {
+            "user_id": user.id,
+            "tenant_id": device.tenant_id,
+            "record_type": record_type,
+            "device_id": device_id
+        }
+    )
+    
+    await db.commit()
+    
+    return {
+        "success": True,
+        "message": message,
+        "record_type": record_type,
+        "user_name": user.full_name,
+        "finger_id": finger_id
+    }
+
+
+@router.post("/device/heartbeat")
+async def device_heartbeat(
+    device_id: str = Header(..., alias="x-device-id"),
+    secret_key: str = Header(..., alias="x-secret-key"),
+    db: AsyncSession = Depends(get_db)
+):
+    """ESP Device sends heartbeat every 30 seconds"""
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == device_id,
+            Device.secret_key == secret_key
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(401, "Invalid device credentials")
+    
+    # Update last_seen and ensure status is online
+    device.last_seen = func.now()
+    device.status = "online"
+    
+    await db.commit()
+    
+    return {
+        "status": "ok",
+        "message": "Heartbeat received",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@router.patch("/device/status")
+async def device_update_status(
+    status: str,
+    device_id: str = Header(..., alias="x-device-id"),
+    secret_key: str = Header(..., alias="x-secret-key"),
+    db: AsyncSession = Depends(get_db)
+):
+    """ESP updates its online/offline status"""
+    
+    if status not in ["online", "offline"]:
+        raise HTTPException(400, "Status must be 'online' or 'offline'")
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == device_id,
+            Device.secret_key == secret_key
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(401, "Invalid device credentials")
+    
+    device.status = status
+    if status == "online":
+        device.last_seen = func.now()
+    
+    await db.commit()
+    
+    return {
+        "status": "ok",
+        "device_status": status
+    }
+
+
+# =========================
+# TENANT DEVICE MANAGEMENT ENDPOINTS
+# =========================
+
+@router.post("/devices")
+async def create_device(
+    data: DeviceCreate,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Register a new biometric device"""
+    
+    # Check if device already exists for this tenant
+    existing = await db.execute(
+        select(Device).where(
+            Device.tenant_id == tenant.id,
+            Device.device_id == data.device_id
+        )
+    )
+    if existing.scalars().first():
+        raise HTTPException(400, "Device ID already exists for this tenant")
+    
+    # Create new device
+    device = Device(
+        tenant_id=tenant.id,
+        device_id=data.device_id,
+        secret_key=data.secret_key,
+        status="offline",
+        last_seen=None
+    )
+    
+    db.add(device)
+    await db.commit()
+    await db.refresh(device)
+    
+    return {
+        "message": "Device registered successfully",
+        "device": {
+            "id": device.id,
+            "device_id": device.device_id,
+            "status": device.status,
+            "last_seen": device.last_seen
+        },
+        "credentials": {
+            "device_id": device.device_id,
+            "secret_key": device.secret_key
+        },
+        "instruction": "Configure your biometric device with these credentials"
+    }
 
 
 @router.get("/devices")
@@ -2698,6 +3852,7 @@ async def list_devices(
     
     return [
         {
+            "id": d.id,
             "device_id": d.device_id,
             "status": d.status,
             "last_seen": d.last_seen
@@ -2725,6 +3880,7 @@ async def get_device(
     if not device:
         raise HTTPException(404, "Device not found")
     
+    # Get recent commands for this device
     commands = await db.execute(text("""
         SELECT id, command, target_id, status, created_at
         FROM commands
@@ -2738,30 +3894,175 @@ async def get_device(
     })
     
     return {
+        "id": device.id,
         "device_id": device.device_id,
+        "secret_key": device.secret_key,
         "status": device.status,
         "last_seen": device.last_seen,
         "recent_commands": commands.mappings().all()
     }
 
 
+@router.put("/devices/{device_id}")
+async def update_device(
+    device_id: str,
+    data: DeviceUpdate,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Update device details"""
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == device_id,
+            Device.tenant_id == tenant.id
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(404, "Device not found")
+    
+    # Check if new device_id conflicts with existing
+    if data.device_id and data.device_id != device.device_id:
+        existing = await db.execute(
+            select(Device).where(
+                Device.tenant_id == tenant.id,
+                Device.device_id == data.device_id
+            )
+        )
+        if existing.scalars().first():
+            raise HTTPException(400, "Device ID already exists for this tenant")
+        device.device_id = data.device_id
+    
+    if data.secret_key:
+        device.secret_key = data.secret_key
+    
+    await db.commit()
+    await db.refresh(device)
+    
+    return {
+        "message": "Device updated successfully",
+        "device": {
+            "id": device.id,
+            "device_id": device.device_id,
+            "status": device.status,
+            "last_seen": device.last_seen
+        }
+    }
+
+
+@router.delete("/devices/{device_id}")
+async def delete_device(
+    device_id: str,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Delete a device"""
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == device_id,
+            Device.tenant_id == tenant.id
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(404, "Device not found")
+    
+    # Delete associated commands first (foreign key constraint)
+    await db.execute(
+        text("DELETE FROM commands WHERE device_id = :device_id AND tenant_id = :tenant_id"),
+        {"device_id": device_id, "tenant_id": tenant.id}
+    )
+    
+    await db.delete(device)
+    await db.commit()
+    
+    return {"message": "Device deleted successfully"}
+
+
 @router.get("/devices/status")
+@router.get("/devices/status/summary")
 async def devices_status(
     tenant: Tenant = Depends(verify_tenant_api_key),
     db: AsyncSession = Depends(get_db)
 ):
-    """Tenant Manager: Get devices status summary"""
+    """Get devices status summary with automatic stale detection"""
     
-    result = await db.execute(text("""
-        SELECT 
-            COUNT(*) as total,
-            COUNT(*) FILTER (WHERE status = 'online') as online,
-            COUNT(*) FILTER (WHERE status != 'online') as offline
-        FROM devices
-        WHERE tenant_id = :tenant_id
-    """), {"tenant_id": tenant.id})
+    # Mark devices as offline if no heartbeat for 2 minutes
+    stale_cutoff = datetime.utcnow() - timedelta(minutes=2)
     
-    return result.mappings().first()
+    await db.execute(
+        text("""
+            UPDATE devices 
+            SET status = 'offline'
+            WHERE tenant_id = :tenant_id
+            AND status = 'online'
+            AND (last_seen IS NULL OR last_seen < :cutoff)
+        """),
+        {"tenant_id": tenant.id, "cutoff": stale_cutoff}
+    )
+    await db.commit()
+    
+    # Get updated statistics
+    result = await db.execute(
+        text("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'online') as online,
+                COUNT(*) FILTER (WHERE status != 'online') as offline
+            FROM devices
+            WHERE tenant_id = :tenant_id
+        """),
+        {"tenant_id": tenant.id}
+    )
+    
+    stats = result.mappings().first()
+    
+    return {
+        "total": stats["total"] or 0,
+        "online": stats["online"] or 0,
+        "offline": stats["offline"] or 0
+    }
+
+
+@router.patch("/devices/{device_id}/status")
+async def update_device_status(
+    device_id: str,
+    status: str,
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update device online/offline status (called by device heartbeat)"""
+    
+    if status not in ["online", "offline"]:
+        raise HTTPException(400, "Status must be 'online' or 'offline'")
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.device_id == device_id,
+            Device.tenant_id == tenant.id
+        )
+    )
+    device = result.scalars().first()
+    
+    if not device:
+        raise HTTPException(404, "Device not found")
+    
+    device.status = status
+    if status == "online":
+        device.last_seen = func.now()
+    
+    await db.commit()
+    
+    return {
+        "message": f"Device status updated to {status}",
+        "device_id": device_id,
+        "status": status,
+        "last_seen": device.last_seen
+    }
 
 
 @router.post("/devices/fire-command")
@@ -2770,8 +4071,9 @@ async def fire_device_command(
     tenant: Tenant = Depends(verify_tenant_api_key),
     db: AsyncSession = Depends(get_db)
 ):
-    """Tenant Manager: Send command to device"""
+    """Tenant Manager: Send command to device (enroll/delete fingerprint)"""
     
+    # Verify device exists
     result = await db.execute(
         select(Device).where(
             Device.device_id == data.device_id,
@@ -2783,28 +4085,99 @@ async def fire_device_command(
     if not device:
         raise HTTPException(404, "Device not found")
     
+    # ✅ Check if device heartbeat is stale (TTL check - 2 minutes)
+    stale_cutoff = datetime.utcnow() - timedelta(minutes=2)
+    is_heartbeat_stale = device.last_seen and device.last_seen < stale_cutoff
+    
+    # Update device status based on heartbeat freshness
+    if is_heartbeat_stale:
+        device.status = "offline"
+        await db.commit()
+        raise HTTPException(409, f"Device {data.device_id} heartbeat is stale (no heartbeat for >2 minutes). Cannot send command.")
+    
+    # Check if device is online
+    if device.status != "online":
+        raise HTTPException(409, f"Device {data.device_id} is offline. Cannot send command.")
+    
+    # Validate command type
+    if data.command not in ["enroll", "delete"]:
+        raise HTTPException(400, "Command must be 'enroll' or 'delete'")
+    
+    # Validate target_id range
+    if data.target_id and (data.target_id < 1 or data.target_id > 127):
+        raise HTTPException(400, "Finger ID must be between 1 and 127")
+    
+    # For enroll command, verify finger_id is assigned to an employee
+    if data.command == "enroll" and data.target_id:
+        emp_result = await db.execute(
+            select(User).where(
+                User.tenant_id == tenant.id,
+                User.finger_id == data.target_id,
+                User.is_active == True
+            )
+        )
+        employee = emp_result.scalars().first()
+        if not employee:
+            raise HTTPException(400, f"No active employee assigned to finger ID {data.target_id}")
+    
+    # Create command record
     cmd = Command(
         tenant_id=tenant.id,
         device_id=data.device_id,
         command=data.command,
-        target_id=data.target_id
+        target_id=data.target_id,
+        status="PENDING"
     )
     
     db.add(cmd)
     await db.commit()
     await db.refresh(cmd)
     
-    mqtt_manager.publish_command(
-        tenant.id,
-        data.device_id,
-        cmd.id,
-        data.command,
-        data.target_id
-    )
+    # Publish MQTT command
+    try:
+        mqtt_manager.publish_command(
+            tenant.id,
+            data.device_id,
+            cmd.id,
+            data.command,
+            data.target_id
+        )
+    except Exception as e:
+        cmd.status = "FAILED"
+        await db.commit()
+        raise HTTPException(500, f"Failed to publish MQTT command: {str(e)}")
     
     return {
-        "message": "Command dispatched",
-        "command_id": cmd.id
+        "message": f"Command '{data.command}' dispatched successfully",
+        "command_id": cmd.id,
+        "device_id": data.device_id,
+        "target_id": data.target_id,
+        "status": "PENDING"
+    }
+
+
+@router.post("/devices/bulk/status")
+async def get_devices_bulk_status(
+    device_ids: List[str],
+    tenant: Tenant = Depends(verify_tenant_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get status for multiple devices at once"""
+    
+    result = await db.execute(
+        select(Device).where(
+            Device.tenant_id == tenant.id,
+            Device.device_id.in_(device_ids)
+        )
+    )
+    devices = result.scalars().all()
+    
+    return {
+        device.device_id: {
+            "status": device.status,
+            "last_seen": device.last_seen
+        }
+        for device in devices
     }
 
 ================================================================================
@@ -3154,37 +4527,38 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from datetime import datetime, date
+from typing import Optional
 from app.db.session import get_db
 from app.api.dependencies import get_current_user
 from app.models.domain import User
+from app.services.tenant_settings_service import (
+    get_tenant_settings, 
+    calculate_valid_working_hours, 
+    calculate_late_status
+)
 
 router = APIRouter()
 
-
-# =========================
-# SPECIFIC ROUTES FIRST!
-# =========================
 
 @router.get("/attendance/today")
 async def get_today_attendance(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Employee: Get today's attendance status"""
+    """Employee: Get today's attendance with working hours"""
+    
+    # Get tenant settings
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    
     query = text("""
         SELECT
             MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
-            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
-                THEN 'present' 
-                ELSE 'absent' 
-            END as status,
-            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out
         FROM attendance_logs
         WHERE user_id = :user_id
         AND DATE(timestamp) = CURRENT_DATE
     """)
+    
     result = await db.execute(query, {"user_id": current_user.id})
     data = result.mappings().first()
     
@@ -3192,16 +4566,84 @@ async def get_today_attendance(
         return {
             "check_in": None,
             "check_out": None,
+            "hours_worked": 0,
+            "met_min_hours": False,
             "status": "absent",
-            "hours_worked": 0
+            "is_late": False
         }
+    
+    valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
+        data["check_in"],
+        data["check_out"],
+        settings
+    )
+    
+    is_late, _ = calculate_late_status(data["check_in"], settings)
     
     return {
         "check_in": data["check_in"],
         "check_out": data["check_out"],
-        "status": data["status"],
-        "hours_worked": round(data["hours_worked"] or 0, 2)
+        "hours_worked": round(valid_hours, 2),
+        "actual_duration": round(actual_duration, 2),
+        "met_min_hours": met_min_hours,
+        "is_late": is_late,
+        "status": "present" if data["check_in"] else "absent"
     }
+
+
+@router.get("/attendance")
+async def get_attendance_history(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    limit: int = 90
+):
+    """Employee: Get personal attendance history with working hours"""
+    
+    # Get tenant settings
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    
+    query = text("""
+        SELECT
+            DATE(timestamp) as attendance_date,
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out
+        FROM attendance_logs
+        WHERE user_id = :user_id
+        GROUP BY DATE(timestamp)
+        ORDER BY attendance_date DESC
+        LIMIT :limit
+    """)
+    
+    result = await db.execute(query, {
+        "user_id": current_user.id,
+        "limit": limit
+    })
+    rows = result.mappings().all()
+    
+    enriched_rows = []
+    for row in rows:
+        valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
+            row["check_in"],
+            row["check_out"],
+            settings
+        )
+        
+        is_late = False
+        if row["check_in"]:
+            is_late, _ = calculate_late_status(row["check_in"], settings)
+        
+        enriched_rows.append({
+            "date": str(row["attendance_date"]),
+            "check_in": row["check_in"],
+            "check_out": row["check_out"],
+            "hours_worked": round(valid_hours, 2),
+            "met_min_hours": met_min_hours,
+            "is_late": is_late,
+            "status": "present" if row["check_in"] else "absent",
+            "punctuality": "late" if is_late else "on_time"
+        })
+    
+    return enriched_rows
 
 
 @router.get("/attendance/stats")
@@ -3209,322 +4651,152 @@ async def get_attendance_stats(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Employee: Get overall attendance statistics"""
+    """Employee: Get overall attendance statistics with working hours compliance"""
     
-    # Get daily aggregates
-    daily_query = text("""
+    # Get tenant settings
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    
+    # Get all attendance records for the employee
+    query = text("""
         SELECT
-            DATE(timestamp) as work_date,
+            DATE(timestamp) as attendance_date,
             MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
-            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00' THEN 1 ELSE 0
-            END as is_late,
-            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out
         FROM attendance_logs
         WHERE user_id = :user_id
-        AND record_type IN ('IN', 'OUT')
         GROUP BY DATE(timestamp)
-        HAVING MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
+        ORDER BY attendance_date DESC
     """)
     
-    daily_result = await db.execute(daily_query, {"user_id": current_user.id})
-    daily_rows = daily_result.mappings().all()
+    result = await db.execute(query, {"user_id": current_user.id})
+    rows = result.mappings().all()
     
-    # Get first and last punch
-    punch_query = text("""
-        SELECT
-            MIN(timestamp) as first_punch,
-            MAX(timestamp) as last_punch
-        FROM attendance_logs
-        WHERE user_id = :user_id
-    """)
-    punch_result = await db.execute(punch_query, {"user_id": current_user.id})
-    punch_data = punch_result.mappings().first()
+    total_days = len(rows)
+    days_with_checkin = 0
+    days_met_min_hours = 0
+    days_late = 0
+    total_valid_hours = 0
     
-    total_present = len(daily_rows)
-    total_late = sum(r["is_late"] or 0 for r in daily_rows)
-    total_hours = sum(r["hours_worked"] or 0 for r in daily_rows)
+    for row in rows:
+        if row["check_in"]:
+            days_with_checkin += 1
+            
+            valid_hours, _, _, met_min, _ = calculate_valid_working_hours(
+                row["check_in"],
+                row["check_out"],
+                settings
+            )
+            total_valid_hours += valid_hours
+            
+            if met_min:
+                days_met_min_hours += 1
+            
+            is_late, _ = calculate_late_status(row["check_in"], settings)
+            if is_late:
+                days_late += 1
     
     return {
-        "total_present_days": total_present,
-        "total_late_days": total_late,
-        "total_hours_worked": round(total_hours, 2),
-        "average_hours_per_day": round(total_hours / max(1, total_present), 2),
-        "first_punch": punch_data["first_punch"] if punch_data else None,
-        "last_punch": punch_data["last_punch"] if punch_data else None
+        "total_days_worked": days_with_checkin,
+        "total_valid_hours": round(total_valid_hours, 2),
+        "days_met_min_hours": days_met_min_hours,
+        "days_late": days_late,
+        "compliance_rate": round((days_met_min_hours / days_with_checkin * 100), 1) if days_with_checkin > 0 else 0,
+        "average_hours": round(total_valid_hours / days_with_checkin, 1) if days_with_checkin > 0 else 0
     }
 
 
 @router.get("/attendance/stats/monthly")
 async def get_monthly_stats(
-    month: int = None,
-    year: int = None,
+    month: int,
+    year: int,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Employee: Get monthly attendance statistics"""
-    from calendar import monthrange
+    """Employee: Get monthly attendance statistics with working hours compliance"""
     
-    if not month:
-        month = datetime.now().month
-    if not year:
-        year = datetime.now().year
+    # Get tenant settings
+    settings = await get_tenant_settings(current_user.tenant_id, db)
     
-    # Get daily aggregates for the month
-    daily_query = text("""
-        SELECT
-            DATE(timestamp) as work_date,
-            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
-            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL THEN 1 ELSE 0
-            END as is_present,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00' THEN 1 ELSE 0
-            END as is_late,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time <= '09:15:00' THEN 1 ELSE 0
-            END as is_on_time,
-            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked
-        FROM attendance_logs
-        WHERE user_id = :user_id
-        AND EXTRACT(MONTH FROM timestamp) = :month
-        AND EXTRACT(YEAR FROM timestamp) = :year
-        AND record_type IN ('IN', 'OUT')
-        GROUP BY DATE(timestamp)
-        HAVING MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
-        ORDER BY work_date
-    """)
-    
-    daily_result = await db.execute(daily_query, {
-        "user_id": current_user.id,
-        "month": month,
-        "year": year
-    })
-    daily_rows = daily_result.mappings().all()
-    
-    # Calculate aggregates
-    present = len(daily_rows)
-    late = sum(1 for r in daily_rows if r["is_late"])
-    on_time = sum(1 for r in daily_rows if r["is_on_time"])
-    total_hours = sum(r["hours_worked"] or 0 for r in daily_rows)
-    
-    _, total_days = monthrange(year, month)
-    working_days = total_days - (total_days // 7 * 2)  # Simplified: exclude weekends
-    
-    # Overtime calculation (assuming 9 hours standard)
-    overtime_hours = sum(max(0, (r["hours_worked"] or 0) - 9) for r in daily_rows)
-    
-    return {
-        "month": month,
-        "year": year,
-        "total_days_in_month": total_days,
-        "estimated_working_days": working_days,
-        "present_days": present,
-        "absent_days": max(0, working_days - present),
-        "late_days": late,
-        "on_time_days": on_time,
-        "total_hours": round(total_hours, 2),
-        "average_hours_per_day": round(total_hours / max(1, present), 2),
-        "overtime_hours": round(overtime_hours, 2),
-        "attendance_percentage": round((present / max(1, working_days)) * 100, 2)
-    }
-
-
-@router.get("/attendance/hours/summary")
-async def get_hours_summary(
-    month: int = None,
-    year: int = None,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Employee: Get detailed hours worked summary"""
-    if not month:
-        month = datetime.now().month
-    if not year:
-        year = datetime.now().year
-    
-    query = text("""
-        SELECT
-            DATE(timestamp) as work_date,
-            MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
-            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
-            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked,
-            CASE 
-                WHEN EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 > 9 
-                THEN EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 - 9
-                ELSE 0
-            END as overtime_hours,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
-                THEN 'late'
-                ELSE 'on_time'
-            END as punctuality
-        FROM attendance_logs
-        WHERE user_id = :user_id
-        AND EXTRACT(MONTH FROM timestamp) = :month
-        AND EXTRACT(YEAR FROM timestamp) = :year
-        AND record_type IN ('IN', 'OUT')
-        GROUP BY DATE(timestamp)
-        HAVING MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
-        ORDER BY work_date DESC
-    """)
-    
-    result = await db.execute(query, {
-        "user_id": current_user.id,
-        "month": month,
-        "year": year
-    })
-    rows = result.mappings().all()
-    
-    total_hours = sum(r["hours_worked"] or 0 for r in rows)
-    total_overtime = sum(r["overtime_hours"] or 0 for r in rows)
-    
-    return {
-        "month": month,
-        "year": year,
-        "daily_breakdown": [
-            {
-                "date": str(r["work_date"]),
-                "check_in": str(r["check_in"]) if r["check_in"] else None,
-                "check_out": str(r["check_out"]) if r["check_out"] else None,
-                "hours_worked": round(r["hours_worked"] or 0, 2),
-                "overtime": round(r["overtime_hours"] or 0, 2),
-                "punctuality": r["punctuality"]
-            }
-            for r in rows
-        ],
-        "summary": {
-            "total_days_worked": len(rows),
-            "total_hours": round(total_hours, 2),
-            "total_overtime": round(total_overtime, 2),
-            "average_hours": round(total_hours / max(1, len(rows)), 2)
-        }
-    }
-
-
-@router.get("/attendance/calendar")
-async def get_attendance_calendar(
-    month: int = None,
-    year: int = None,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Employee: Get calendar-style attendance view"""
-    if not month:
-        month = datetime.now().month
-    if not year:
-        year = datetime.now().year
-    
-    query = text("""
-        SELECT
-            EXTRACT(DAY FROM DATE(timestamp)) as day_num,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
-                THEN 'present' 
-                ELSE 'absent' 
-            END as status,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
-                THEN 'late'
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
-                THEN 'on_time'
-                ELSE NULL
-            END as punctuality
-        FROM attendance_logs
-        WHERE user_id = :user_id
-        AND EXTRACT(MONTH FROM timestamp) = :month
-        AND EXTRACT(YEAR FROM timestamp) = :year
-        GROUP BY DATE(timestamp)
-        ORDER BY day_num
-    """)
-    
-    result = await db.execute(query, {
-        "user_id": current_user.id,
-        "month": month,
-        "year": year
-    })
-    rows = result.mappings().all()
-    
-    from calendar import monthrange
-    _, total_days = monthrange(year, month)
-    
-    calendar_data = {}
-    for row in rows:
-        day = int(row["day_num"])
-        calendar_data[day] = {
-            "status": row["status"],
-            "punctuality": row["punctuality"]
-        }
-    
-    # Fill missing days as absent or weekend
-    for day in range(1, total_days + 1):
-        if day not in calendar_data:
-            # Check if weekend (Saturday=5, Sunday=6 in Python's weekday)
-            import datetime as dt
-            weekday = dt.date(year, month, day).weekday()
-            is_weekend = weekday >= 5
-            calendar_data[day] = {
-                "status": "weekend" if is_weekend else "absent",
-                "punctuality": None
-            }
-    
-    return {
-        "month": month,
-        "year": year,
-        "total_days": total_days,
-        "calendar": calendar_data
-    }
-
-
-# =========================
-# GENERIC ROUTES LAST!
-# =========================
-
-@router.get("/attendance")
-async def get_attendance(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Employee: Get personal attendance history"""
+    # Get all attendance records for the month
     query = text("""
         SELECT
             DATE(timestamp) as attendance_date,
             MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
-            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
-            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
-                THEN 'present' ELSE 'absent' 
-            END as status,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
-                THEN 'late'
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
-                THEN 'on_time'
-                ELSE NULL
-            END as punctuality
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out
         FROM attendance_logs
         WHERE user_id = :user_id
+        AND EXTRACT(MONTH FROM timestamp) = :month
+        AND EXTRACT(YEAR FROM timestamp) = :year
         GROUP BY DATE(timestamp)
-        ORDER BY attendance_date DESC
-        LIMIT 90
     """)
-    result = await db.execute(query, {"user_id": current_user.id})
+    
+    result = await db.execute(query, {
+        "user_id": current_user.id,
+        "month": month,
+        "year": year
+    })
     rows = result.mappings().all()
     
-    return [
-        {
-            "date": str(r["attendance_date"]),
-            "check_in": str(r["check_in"]) if r["check_in"] else None,
-            "check_out": str(r["check_out"]) if r["check_out"] else None,
-            "hours_worked": round(r["hours_worked"] or 0, 2),
-            "status": r["status"],
-            "punctuality": r["punctuality"]
-        }
-        for r in rows
-    ]
+    # Calculate statistics
+    present_days = 0
+    days_met_min_hours = 0
+    late_days = 0
+    on_time_days = 0
+    total_valid_hours = 0
+    
+    for row in rows:
+        if row["check_in"]:
+            present_days += 1
+            
+            valid_hours, _, _, met_min, _ = calculate_valid_working_hours(
+                row["check_in"],
+                row["check_out"],
+                settings
+            )
+            total_valid_hours += valid_hours
+            
+            if met_min:
+                days_met_min_hours += 1
+            
+            is_late, _ = calculate_late_status(row["check_in"], settings)
+            if is_late:
+                late_days += 1
+            else:
+                on_time_days += 1
+    
+    # Calculate working days in month (Mon-Fri)
+    from calendar import monthrange
+    import datetime as dt
+    
+    first_day = dt.date(year, month, 1)
+    last_day = dt.date(year, month, monthrange(year, month)[1])
+    
+    working_days = 0
+    current = first_day
+    while current <= last_day:
+        if current.weekday() < 5:  # Monday to Friday
+            working_days += 1
+        current += dt.timedelta(days=1)
+    
+    absent_days = max(0, working_days - present_days)
+    attendance_percentage = round((present_days / working_days * 100), 1) if working_days > 0 else 0
+    compliance_rate = round((days_met_min_hours / present_days * 100), 1) if present_days > 0 else 0
+    avg_hours = round(total_valid_hours / present_days, 1) if present_days > 0 else 0
+    
+    return {
+        "present_days": present_days,
+        "days_met_min_hours": days_met_min_hours,
+        "total_hours": round(total_valid_hours, 1),
+        "attendance_percentage": attendance_percentage,
+        "total_days_in_month": monthrange(year, month)[1],
+        "estimated_working_days": working_days,
+        "absent_days": absent_days,
+        "late_days": late_days,
+        "on_time_days": on_time_days,
+        "overtime_hours": 0,
+        "average_hours_per_day": avg_hours,
+        "compliance_rate": compliance_rate
+    }
 
 
 @router.get("/attendance/{date_str}")
@@ -3534,32 +4806,23 @@ async def get_attendance_by_date(
     db: AsyncSession = Depends(get_db)
 ):
     """Employee: Get attendance for a specific date (YYYY-MM-DD)"""
+    
     try:
         target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
     
+    # Get tenant settings
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    
     query = text("""
         SELECT
-            DATE(timestamp) as attendance_date,
             MIN(timestamp) FILTER (WHERE record_type = 'IN') as check_in,
-            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out,
-            EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600 as hours_worked,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
-                THEN 'present' ELSE 'absent' 
-            END as status,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
-                THEN 'late'
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
-                THEN 'on_time'
-                ELSE NULL
-            END as punctuality
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') as check_out
         FROM attendance_logs
         WHERE user_id = :user_id AND DATE(timestamp) = :target_date
-        GROUP BY DATE(timestamp)
     """)
+    
     result = await db.execute(query, {
         "user_id": current_user.id,
         "target_date": target_date
@@ -3568,60 +4831,31 @@ async def get_attendance_by_date(
     
     if not data or not data["check_in"]:
         return {
-            "attendance_date": date_str,
+            "date": date_str,
             "check_in": None,
             "check_out": None,
             "hours_worked": 0,
+            "met_min_hours": False,
             "status": "absent",
-            "punctuality": None
+            "is_late": False
         }
     
-    return {
-        "attendance_date": str(data["attendance_date"]),
-        "check_in": str(data["check_in"]) if data["check_in"] else None,
-        "check_out": str(data["check_out"]) if data["check_out"] else None,
-        "hours_worked": round(data["hours_worked"] or 0, 2),
-        "status": data["status"],
-        "punctuality": data["punctuality"]
-    }
-
-
-@router.get("/attendance/export")
-async def export_attendance(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Employee: Export attendance data as CSV-ready format"""
-    query = text("""
-        SELECT
-            TO_CHAR(DATE(timestamp), 'YYYY-MM-DD') as date,
-            TO_CHAR(MIN(timestamp) FILTER (WHERE record_type = 'IN'), 'HH24:MI:SS') as check_in,
-            TO_CHAR(MAX(timestamp) FILTER (WHERE record_type = 'OUT'), 'HH24:MI:SS') as check_out,
-            ROUND(EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp)))/3600, 2) as hours_worked,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL 
-                THEN 'Present' ELSE 'Absent' 
-            END as status,
-            CASE 
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN')::time > '09:15:00'
-                THEN 'Late'
-                WHEN MIN(timestamp) FILTER (WHERE record_type = 'IN') IS NOT NULL
-                THEN 'On Time'
-                ELSE '-'
-            END as punctuality
-        FROM attendance_logs
-        WHERE user_id = :user_id
-        GROUP BY DATE(timestamp)
-        ORDER BY date DESC
-    """)
-    result = await db.execute(query, {"user_id": current_user.id})
-    rows = result.mappings().all()
+    valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
+        data["check_in"],
+        data["check_out"],
+        settings
+    )
+    
+    is_late, _ = calculate_late_status(data["check_in"], settings)
     
     return {
-        "message": "Export ready",
-        "format": "csv",
-        "total_records": len(rows),
-        "data": [dict(r) for r in rows]
+        "date": date_str,
+        "check_in": data["check_in"],
+        "check_out": data["check_out"],
+        "hours_worked": round(valid_hours, 2),
+        "met_min_hours": met_min_hours,
+        "is_late": is_late,
+        "status": "present" if data["check_in"] else "absent"
     }
 
 ================================================================================
@@ -4274,13 +5508,19 @@ async def upcoming_holiday(
 FILE: api/routes/org_admin/attendance.py
 ================================================================================
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from datetime import date
+from datetime import date, datetime
+from typing import Optional
 from app.db.session import get_db
 from app.api.dependencies import get_current_user, require_role
 from app.models.domain import User
+from app.services.tenant_settings_service import (
+    get_tenant_settings, 
+    calculate_valid_working_hours, 
+    calculate_late_status
+)
 
 router = APIRouter()
 
@@ -4290,20 +5530,59 @@ async def today_attendance(
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
+    """Org Admin: Today's attendance for department with working hours calculation"""
+    
+    # Get tenant settings
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    
     result = await db.execute(text("""
         SELECT 
-            u.id, u.name, u.employee_code,
+            u.id, 
+            u.name, 
+            u.employee_code,
             MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
-            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out,
-            CASE WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') IS NOT NULL 
-                THEN 'present' ELSE 'absent' END as status
+            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out
         FROM users u
         LEFT JOIN attendance_logs a ON u.id = a.user_id AND DATE(a.timestamp) = CURRENT_DATE
-        WHERE u.tenant_id = :tenant_id AND u.dept_id = :dept_id 
-        AND u.role = 'employee' AND u.is_active = true
-        GROUP BY u.id ORDER BY u.name
-    """), {"tenant_id": current_user.tenant_id, "dept_id": current_user.dept_id})
-    return result.mappings().all()
+        WHERE u.tenant_id = :tenant_id 
+        AND u.dept_id = :dept_id 
+        AND u.role = 'employee' 
+        AND u.is_active = true
+        GROUP BY u.id 
+        ORDER BY u.name
+    """), {
+        "tenant_id": current_user.tenant_id, 
+        "dept_id": current_user.dept_id
+    })
+    
+    rows = result.mappings().all()
+    
+    # Calculate working hours for each employee
+    enriched_rows = []
+    for row in rows:
+        valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
+            row["check_in"],
+            row["check_out"],
+            settings
+        )
+        
+        is_late = False
+        if row["check_in"]:
+            is_late, _ = calculate_late_status(row["check_in"], settings)
+        
+        enriched_rows.append({
+            "id": row["id"],
+            "name": row["name"],
+            "employee_code": row["employee_code"],
+            "check_in": row["check_in"],
+            "check_out": row["check_out"],
+            "hours_worked": round(valid_hours, 2),
+            "met_min_hours": met_min_hours,
+            "is_late": is_late,
+            "status": "present" if row["check_in"] else "absent"
+        })
+    
+    return enriched_rows
 
 
 @router.get("/attendance/date/{attendance_date}")
@@ -4312,25 +5591,82 @@ async def attendance_by_date(
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
+    """Org Admin: Attendance for specific date with working hours calculation"""
+    
+    # Get tenant settings
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    
     result = await db.execute(text("""
         SELECT 
-            u.id, u.name, u.employee_code,
+            u.id, 
+            u.name, 
+            u.employee_code,
             MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
-            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out,
-            CASE WHEN MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') IS NOT NULL 
-                THEN 'present' ELSE 'absent' END as status
+            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out
         FROM users u
         LEFT JOIN attendance_logs a ON u.id = a.user_id AND DATE(a.timestamp) = :attendance_date
-        WHERE u.tenant_id = :tenant_id AND u.dept_id = :dept_id 
-        AND u.role = 'employee' AND u.is_active = true
-        GROUP BY u.id ORDER BY u.name
-    """), {"tenant_id": current_user.tenant_id, "dept_id": current_user.dept_id, "attendance_date": attendance_date})
-    return result.mappings().all()
+        WHERE u.tenant_id = :tenant_id 
+        AND u.dept_id = :dept_id 
+        AND u.role = 'employee' 
+        AND u.is_active = true
+        GROUP BY u.id 
+        ORDER BY u.name
+    """), {
+        "tenant_id": current_user.tenant_id,
+        "dept_id": current_user.dept_id,
+        "attendance_date": attendance_date
+    })
+    
+    rows = result.mappings().all()
+    
+    # Calculate working hours for each employee
+    enriched_rows = []
+    for row in rows:
+        valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
+            row["check_in"],
+            row["check_out"],
+            settings
+        )
+        
+        is_late = False
+        if row["check_in"]:
+            is_late, _ = calculate_late_status(row["check_in"], settings)
+        
+        enriched_rows.append({
+            "id": row["id"],
+            "name": row["name"],
+            "employee_code": row["employee_code"],
+            "check_in": row["check_in"],
+            "check_out": row["check_out"],
+            "hours_worked": round(valid_hours, 2),
+            "met_min_hours": met_min_hours,
+            "is_late": is_late,
+            "status": "present" if row["check_in"] else "absent"
+        })
+    
+    # Calculate summary
+    total = len(enriched_rows)
+    present = len([r for r in enriched_rows if r["check_in"]])
+    met_min = len([r for r in enriched_rows if r["met_min_hours"]])
+    
+    return {
+        "date": attendance_date,
+        "summary": {
+            "total_employees": total,
+            "present": present,
+            "absent": total - present,
+            "met_minimum_hours": met_min,
+            "attendance_rate": round((present / total * 100), 1) if total > 0 else 0,
+            "compliance_rate": round((met_min / present * 100), 1) if present > 0 else 0
+        },
+        "employees": enriched_rows
+    }
 
 ================================================================================
 FILE: api/routes/org_admin/__init__.py
 ================================================================================
 
+# api/routes/org_admin/__init__.py
 from app.api.routes.org_admin import (
     dashboard,
     employees,
@@ -5091,7 +6427,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import text
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Optional
 from app.db.session import get_db
 from app.api.dependencies import get_current_user, require_role
 from app.models.domain import User, Device, Command
@@ -5100,19 +6437,52 @@ from app.mqtt.client import mqtt_manager
 router = APIRouter()
 
 
-# =========================
-# SCHEMAS
-# =========================
+class DeviceCreate(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=100)
+    secret_key: str = Field(..., min_length=8)
+
 
 class FireCommandRequest(BaseModel):
     device_id: str
     command: str  # 'enroll' or 'delete'
-    target_id: int  # finger_id
+    target_id: int
 
 
-# =========================
-# ROUTES
-# =========================
+@router.post("/devices")
+async def create_device(
+    data: DeviceCreate,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Org Admin: Register a new device for their department's tenant"""
+    
+    # Check if device exists
+    existing = await db.execute(
+        select(Device).where(
+            Device.tenant_id == current_user.tenant_id,
+            Device.device_id == data.device_id
+        )
+    )
+    if existing.scalars().first():
+        raise HTTPException(400, "Device ID already exists")
+    
+    device = Device(
+        tenant_id=current_user.tenant_id,
+        device_id=data.device_id,
+        secret_key=data.secret_key,
+        status="offline"
+    )
+    
+    db.add(device)
+    await db.commit()
+    await db.refresh(device)
+    
+    return {
+        "message": "Device registered successfully",
+        "device_id": device.device_id,
+        "secret_key": device.secret_key
+    }
+
 
 @router.get("/devices")
 async def list_devices(
@@ -5122,9 +6492,9 @@ async def list_devices(
     """Org Admin: List all devices in their tenant"""
     
     result = await db.execute(
-        select(Device)
-        .where(Device.tenant_id == current_user.tenant_id)
-        .order_by(Device.device_id)
+        select(Device).where(
+            Device.tenant_id == current_user.tenant_id
+        ).order_by(Device.device_id)
     )
     devices = result.scalars().all()
     
@@ -5136,46 +6506,6 @@ async def list_devices(
         }
         for d in devices
     ]
-
-
-@router.get("/devices/{device_id}")
-async def get_device(
-    device_id: str,
-    current_user: User = Depends(require_role("org_admin")),
-    db: AsyncSession = Depends(get_db)
-):
-    """Org Admin: Get device details"""
-    
-    result = await db.execute(
-        select(Device).where(
-            Device.device_id == device_id,
-            Device.tenant_id == current_user.tenant_id
-        )
-    )
-    device = result.scalars().first()
-    
-    if not device:
-        raise HTTPException(404, "Device not found")
-    
-    # Get recent commands for this device
-    commands = await db.execute(text("""
-        SELECT id, command, target_id, status, created_at
-        FROM commands
-        WHERE device_id = :device_id
-        AND tenant_id = :tenant_id
-        ORDER BY created_at DESC
-        LIMIT 20
-    """), {
-        "device_id": device_id,
-        "tenant_id": current_user.tenant_id
-    })
-    
-    return {
-        "device_id": device.device_id,
-        "status": device.status,
-        "last_seen": device.last_seen,
-        "recent_commands": commands.mappings().all()
-    }
 
 
 @router.get("/devices/status")
@@ -5203,12 +6533,7 @@ async def fire_device_command(
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Org Admin: Send command to device (enroll/delete fingerprint)
-    
-    This allows Org Admin to directly enroll fingerprints without
-    going through Tenant Manager.
-    """
+    """Org Admin: Send command to device (enroll/delete fingerprint)"""
     
     # Verify device belongs to this tenant
     result = await db.execute(
@@ -5226,23 +6551,23 @@ async def fire_device_command(
     if data.command not in ["enroll", "delete"]:
         raise HTTPException(400, "Command must be 'enroll' or 'delete'")
     
-    # Validate target_id (finger_id) range
+    # Validate target_id range
     if data.target_id < 1 or data.target_id > 127:
         raise HTTPException(400, "Finger ID must be between 1 and 127")
     
-    # For enroll command, verify the finger_id is assigned to an employee
+    # For enroll command, verify the finger_id is assigned to an employee in their department
     if data.command == "enroll":
-        from app.models.domain import User
         emp_result = await db.execute(
             select(User).where(
                 User.tenant_id == current_user.tenant_id,
                 User.finger_id == data.target_id,
+                User.dept_id == current_user.dept_id,
                 User.is_active == True
             )
         )
         employee = emp_result.scalars().first()
         if not employee:
-            raise HTTPException(400, f"No active employee assigned to finger ID {data.target_id}")
+            raise HTTPException(400, f"No active employee in your department assigned to finger ID {data.target_id}")
     
     # Create command record
     cmd = Command(
@@ -5387,6 +6712,188 @@ class MQTTManager:
 
 
 mqtt_manager = MQTTManager()
+
+================================================================================
+FILE: services/tenant_settings_service.py
+================================================================================
+
+"""
+Tenant Settings Service - Core service for managing and caching tenant settings
+"""
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from datetime import datetime, time, date
+from typing import Optional, Dict, Any
+import logging
+
+logger = logging.getLogger(__name__)
+
+# In-memory cache with TTL
+_settings_cache: Dict[int, Dict[str, Any]] = {}
+_cache_timestamps: Dict[int, datetime] = {}
+CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+async def get_tenant_settings(
+    tenant_id: int,
+    db: AsyncSession,
+    force_refresh: bool = False
+) -> Dict[str, Any]:
+    """
+    Get tenant settings from database with caching.
+    Returns dict with all settings including parsed time objects.
+    """
+    # Check cache
+    if not force_refresh and tenant_id in _settings_cache:
+        cached_time = _cache_timestamps.get(tenant_id)
+        if cached_time and (datetime.now() - cached_time).seconds < CACHE_TTL_SECONDS:
+            logger.debug(f"Returning cached settings for tenant {tenant_id}")
+            return _settings_cache[tenant_id].copy()
+    
+    # Fetch from database
+    result = await db.execute(text("""
+        SELECT 
+            office_start_time,
+            office_end_time,
+            late_threshold_minutes,
+            working_days,
+            min_working_hours,
+            updated_at
+        FROM settings
+        WHERE tenant_id = :tenant_id
+        LIMIT 1
+    """), {"tenant_id": tenant_id})
+    
+    row = result.mappings().first()
+    
+    # Default settings if none found
+    if not row:
+        settings = {
+            "office_start_time": "09:00:00",
+            "office_end_time": "18:00:00",
+            "late_threshold_minutes": 15,
+            "working_days": "1,2,3,4,5",
+            "min_working_hours": 9.0,
+            "updated_at": None
+        }
+    else:
+        settings = dict(row)
+        if settings.get("min_working_hours") is None:
+            settings["min_working_hours"] = 9.0
+    
+    # Parse time strings to time objects
+    settings["office_start"] = datetime.strptime(
+        settings["office_start_time"], "%H:%M:%S"
+    ).time()
+    settings["office_end"] = datetime.strptime(
+        settings["office_end_time"], "%H:%M:%S"
+    ).time()
+    
+    # Parse working days
+    settings["working_days_list"] = [
+        int(d.strip()) for d in settings["working_days"].split(",") if d.strip()
+    ]
+    
+    # Cache the result
+    _settings_cache[tenant_id] = settings.copy()
+    _cache_timestamps[tenant_id] = datetime.now()
+    
+    logger.debug(f"Cached settings for tenant {tenant_id}")
+    return settings
+
+
+def invalidate_tenant_settings_cache(tenant_id: int):
+    """Invalidate cached settings for a tenant"""
+    if tenant_id in _settings_cache:
+        del _settings_cache[tenant_id]
+    if tenant_id in _cache_timestamps:
+        del _cache_timestamps[tenant_id]
+    logger.info(f"Invalidated settings cache for tenant {tenant_id}")
+
+
+def calculate_late_status(
+    check_in_time: datetime,
+    settings: Dict[str, Any]
+) -> tuple[bool, str]:
+    """Calculate if a check-in time is considered late."""
+    office_start = settings["office_start"]
+    late_threshold = settings["late_threshold_minutes"]
+    
+    # Calculate threshold time (office start + late threshold)
+    total_minutes = office_start.hour * 60 + office_start.minute + late_threshold
+    threshold_hour = total_minutes // 60
+    threshold_minute = total_minutes % 60
+    threshold_time = time(threshold_hour, threshold_minute)
+    
+    check_time = check_in_time.time()
+    
+    if check_time > threshold_time:
+        return True, f"Late (after {threshold_time.strftime('%H:%M')})"
+    return False, f"On time (before {threshold_time.strftime('%H:%M')})"
+
+
+def calculate_valid_working_hours(
+    check_in_time: Optional[datetime],
+    check_out_time: Optional[datetime],
+    settings: Dict[str, Any]
+) -> tuple[float, float, float, bool, str]:
+    """
+    Calculate working hours WITHIN official office hours only.
+    
+    Returns:
+        (valid_hours, actual_duration, lost_hours, met_min_hours, status_message)
+        
+    Rules:
+    - If check-in is before office start, count from office start
+    - If check-out is after office end, count until office end
+    - Time outside office hours is NOT counted
+    """
+    if not check_in_time or not check_out_time:
+        return 0.0, 0.0, 0.0, False, "Incomplete attendance"
+    
+    office_start = settings["office_start"]
+    office_end = settings["office_end"]
+    min_hours = settings.get("min_working_hours", 9.0)
+    
+    # Convert to datetime for the same day
+    work_date = check_in_time.date()
+    
+    # Get office boundaries as datetime
+    office_start_dt = datetime.combine(work_date, office_start)
+    office_end_dt = datetime.combine(work_date, office_end)
+    
+    # Actual duration (total time between check-in and check-out)
+    actual_duration = (check_out_time - check_in_time).total_seconds() / 3600
+    
+    # Valid working hours = only time within office hours
+    valid_start = max(check_in_time, office_start_dt)
+    valid_end = min(check_out_time, office_end_dt)
+    
+    if valid_end > valid_start:
+        valid_hours = (valid_end - valid_start).total_seconds() / 3600
+    else:
+        valid_hours = 0
+    
+    # Calculate lost hours (time outside office hours)
+    lost_hours = actual_duration - valid_hours
+    
+    # Check if met minimum working hours requirement
+    met_min_hours = valid_hours >= min_hours
+    
+    # Create status message
+    if lost_hours > 0.1:  # More than 0.1 hour (6 minutes) lost
+        status_msg = f"{valid_hours:.1f}h worked within office hours ({lost_hours:.1f}h outside office)"
+    else:
+        status_msg = f"{valid_hours:.1f}h worked"
+    
+    return valid_hours, actual_duration, lost_hours, met_min_hours, status_msg
+
+
+def is_working_day(check_date: date, settings: Dict[str, Any]) -> bool:
+    """Check if a given date is a working day."""
+    python_weekday = check_date.weekday()
+    our_weekday = python_weekday + 1
+    return our_weekday in settings.get("working_days_list", [1, 2, 3, 4, 5])
 
 ================================================================================
 FILE: services/notification_service.py
@@ -5707,59 +7214,64 @@ async def delete_user(
 FILE: services/attendance_service.py
 ================================================================================
 
+"""
+Attendance Service - Core attendance processing logic
+"""
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.future import select
-from sqlalchemy import desc
+from sqlalchemy import desc, text
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Tuple, Dict, Any
+
 from app.models.domain import AttendanceLog, User
-import datetime
-from datetime import timedelta
+from app.services.tenant_settings_service import (
+    get_tenant_settings,
+    calculate_late_status,
+    calculate_valid_working_hours,
+    invalidate_tenant_settings_cache
+)
 
 
-# =========================
-# HELPER: GET USER BY FINGER
-# =========================
-
-async def get_user_by_finger(tenant_id: int, finger_id: int, db: AsyncSession):
+async def get_user_by_finger(tenant_id: int, finger_id: int, db: AsyncSession) -> Optional[User]:
+    """Get user by fingerprint ID"""
     result = await db.execute(
         select(User).where(
             User.tenant_id == tenant_id,
-            User.finger_id == finger_id
+            User.finger_id == finger_id,
+            User.is_active == True
         )
     )
     return result.scalars().first()
 
-
-# =========================
-# SINGLE ATTENDANCE
-# =========================
 
 async def process_attendance(
     tenant_id: int,
     device_id: str,
     finger_id: int,
     db: AsyncSession
-):
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    # =========================
-    # 1. GET USER
-    # =========================
+) -> Tuple[AttendanceLog, str, bool, str]:
+    """
+    Process a single attendance punch (IN/OUT).
+    
+    Returns:
+        (attendance_log, user_name, is_late, late_message)
+    """
+    now = datetime.now(timezone.utc)
+    
+    # Get tenant settings
+    settings = await get_tenant_settings(tenant_id, db)
+    
+    # Get user
     user = await get_user_by_finger(tenant_id, finger_id, db)
-
     user_id = user.id if user else None
     user_name = user.name if user else "Unknown User"
-    employee_code = user.employee_code if user else None
-
-    # =========================
-    # 2. TODAY START
-    # =========================
+    
+    # Get today's start
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    # =========================
-    # 3. LAST LOG
-    # =========================
+    
+    # Get last log for today
     result = await db.execute(
         select(AttendanceLog)
         .where(
@@ -5770,120 +7282,252 @@ async def process_attendance(
         .order_by(desc(AttendanceLog.timestamp))
         .limit(1)
     )
-
     last_log = result.scalars().first()
-
-    # =========================
-    # 4. SMART LOGIC
-    # =========================
-    current_type = "IN"
-
-    if last_log:
-        time_diff = now - last_log.timestamp
-
-        # 🚨 Prevent duplicate scan within 5 minutes
-        if time_diff < timedelta(minutes=1):
-            return last_log, user_name
-
-        current_type = "OUT" if last_log.record_type == "IN" else "IN"
-
-    # =========================
-    # 5. SAVE LOG
-    # =========================
+    
+    # Determine IN or OUT
+    if not last_log or last_log.record_type == "OUT":
+        record_type = "IN"
+    else:
+        record_type = "OUT"
+    
+    # Calculate late status (only for IN punches)
+    is_late = False
+    late_message = None
+    if record_type == "IN" and user:
+        is_late, late_message = calculate_late_status(now, settings)
+    
+    # Create attendance log
     log = AttendanceLog(
         tenant_id=tenant_id,
         device_id=device_id,
         finger_id=finger_id,
-        user_id=user_id,   # ✅ NEW
+        user_id=user_id,
         timestamp=now,
-        record_type=current_type
+        record_type=record_type
     )
-
+    
     db.add(log)
     await db.commit()
     await db.refresh(log)
+    
+    return log, user_name, is_late, late_message or ""
 
-    return log, user_name
-
-
-# =========================
-# BULK ATTENDANCE (OFFLINE)
-# =========================
 
 async def process_bulk_attendance(
     tenant_id: int,
     device_id: str,
-    logs: list,
+    logs: List[Any],
     db: AsyncSession
-):
+) -> int:
+    """Process bulk attendance logs from offline device sync"""
     if not logs:
         return 0
-
+    
     values = []
-
-    for l in logs:
-        user = await get_user_by_finger(tenant_id, l.finger_id, db)
-
+    
+    for log_item in logs:
+        user = await get_user_by_finger(tenant_id, log_item.finger_id, db)
+        
         values.append({
             "tenant_id": tenant_id,
             "device_id": device_id,
-            "finger_id": l.finger_id,
-            "user_id": user.id if user else None,  # ✅ NEW
-            "timestamp": l.timestamp,
+            "finger_id": log_item.finger_id,
+            "user_id": user.id if user else None,
+            "timestamp": log_item.timestamp,
             "record_type": "IN"
         })
-
+    
     stmt = insert(AttendanceLog).values(values)
-    stmt = stmt.on_conflict_do_nothing(
-        constraint='uix_attendance_record'
-    )
-
+    stmt = stmt.on_conflict_do_nothing(constraint='uix_attendance_record')
+    
     result = await db.execute(stmt)
     await db.commit()
-
+    
     return result.rowcount or 0
 
 
-# =========================
-# HISTORY
-# =========================
-
 async def get_attendance_history(
     tenant_id: int,
-    db: AsyncSession
-):
-    stmt = (
-        select(
-            AttendanceLog,
-            User.name,
-            User.employee_code
+    db: AsyncSession,
+    limit: int = 50,
+    offset: int = 0,
+    user_id: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """Get attendance history with working hours calculation"""
+    
+    settings = await get_tenant_settings(tenant_id, db)
+    
+    query = """
+        WITH daily_attendance AS (
+            SELECT 
+                user_id,
+                DATE(timestamp) as attendance_date,
+                MIN(CASE WHEN record_type = 'IN' THEN timestamp END) as check_in,
+                MAX(CASE WHEN record_type = 'OUT' THEN timestamp END) as check_out
+            FROM attendance_logs
+            WHERE tenant_id = :tenant_id
+    """
+    
+    params = {"tenant_id": tenant_id}
+    
+    if user_id:
+        query += " AND user_id = :user_id"
+        params["user_id"] = user_id
+    
+    query += """
+            GROUP BY user_id, DATE(timestamp)
         )
-        .outerjoin(
-            User,
-            AttendanceLog.user_id == User.id   # ✅ FIXED JOIN
+        SELECT 
+            u.id as user_id,
+            u.name as user_name,
+            u.employee_code,
+            d.department_name,
+            da.attendance_date,
+            da.check_in,
+            da.check_out
+        FROM daily_attendance da
+        JOIN users u ON da.user_id = u.id
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        WHERE u.tenant_id = :tenant_id
+        ORDER BY da.attendance_date DESC
+        LIMIT :limit OFFSET :offset
+    """
+    
+    params["limit"] = limit
+    params["offset"] = offset
+    
+    result = await db.execute(text(query), params)
+    rows = result.mappings().all()
+    
+    # Enrich with working hours calculation
+    enriched_rows = []
+    for row in rows:
+        valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
+            row["check_in"],
+            row["check_out"],
+            settings
         )
-        .where(AttendanceLog.tenant_id == tenant_id)
-        .order_by(AttendanceLog.timestamp.desc())
-        .limit(50)
-    )
-
-    result = await db.execute(stmt)
-
-    response_data = []
-
-    for row in result.mappings():
-        log = row["AttendanceLog"]
-        user_name = row["name"]
-        employee_code = row["employee_code"]
-
-        response_data.append({
-            "timestamp": log.timestamp,
-            "finger_id": log.finger_id,
-            "user_id": log.user_id,              # ✅ NEW
-            "employee_code": employee_code,      # ✅ NEW
-            "device_id": log.device_id,
-            "record_type": log.record_type,
-            "user_name": user_name or "Unknown"
+        
+        enriched_rows.append({
+            "date": row["attendance_date"],
+            "user_id": row["user_id"],
+            "user_name": row["user_name"],
+            "employee_code": row["employee_code"],
+            "department_name": row["department_name"],
+            "check_in": row["check_in"],
+            "check_out": row["check_out"],
+            "hours_worked": valid_hours,
+            "actual_duration": actual_duration,
+            "lost_hours": lost_hours,
+            "met_min_hours": met_min_hours,
+            "status_message": status_msg
         })
+    
+    return enriched_rows
 
-    return response_data
+
+async def get_today_summary(
+    tenant_id: int,
+    db: AsyncSession,
+    dept_id: Optional[int] = None
+) -> Dict[str, Any]:
+    """Get today's attendance summary with statistics"""
+    
+    settings = await get_tenant_settings(tenant_id, db)
+    today = datetime.now().date()
+    
+    # Get all active employees
+    emp_query = """
+        SELECT u.id, u.name, u.employee_code, u.dept_id, d.department_name
+        FROM users u
+        LEFT JOIN departments d ON u.dept_id = d.department_id
+        WHERE u.tenant_id = :tenant_id
+        AND u.role = 'employee'
+        AND u.is_active = true
+    """
+    
+    emp_params = {"tenant_id": tenant_id}
+    if dept_id:
+        emp_query += " AND u.dept_id = :dept_id"
+        emp_params["dept_id"] = dept_id
+    
+    employees_result = await db.execute(text(emp_query), emp_params)
+    employees = employees_result.mappings().all()
+    
+    # Get today's attendance
+    att_query = """
+        SELECT 
+            user_id,
+            MIN(CASE WHEN record_type = 'IN' THEN timestamp END) as check_in,
+            MAX(CASE WHEN record_type = 'OUT' THEN timestamp END) as check_out
+        FROM attendance_logs
+        WHERE tenant_id = :tenant_id
+        AND DATE(timestamp) = CURRENT_DATE
+        GROUP BY user_id
+    """
+    
+    attendance_result = await db.execute(text(att_query), {"tenant_id": tenant_id})
+    attendance_map = {row["user_id"]: row for row in attendance_result.mappings().all()}
+    
+    # Build summary for each employee
+    employee_summaries = []
+    present_count = 0
+    late_count = 0
+    met_min_hours_count = 0
+    total_valid_hours = 0
+    
+    for emp in employees:
+        att = attendance_map.get(emp["id"])
+        
+        if att and att["check_in"]:
+            present_count += 1
+            is_late, _ = calculate_late_status(att["check_in"], settings)
+            if is_late:
+                late_count += 1
+            
+            valid_hours, actual_duration, lost_hours, met_min, status_msg = calculate_valid_working_hours(
+                att["check_in"],
+                att["check_out"],
+                settings
+            )
+            if met_min:
+                met_min_hours_count += 1
+            total_valid_hours += valid_hours
+        else:
+            valid_hours = 0
+            met_min = False
+            is_late = False
+            status_msg = "No check-in"
+        
+        employee_summaries.append({
+            "id": emp["id"],
+            "name": emp["name"],
+            "employee_code": emp["employee_code"],
+            "department_name": emp["department_name"],
+            "check_in": att["check_in"] if att else None,
+            "check_out": att["check_out"] if att else None,
+            "hours_worked": valid_hours,
+            "met_min_hours": met_min,
+            "is_late": is_late,
+            "status_message": status_msg
+        })
+    
+    total_employees = len(employees)
+    absent_count = total_employees - present_count
+    avg_hours = total_valid_hours / present_count if present_count > 0 else 0
+    
+    return {
+        "date": today,
+        "summary": {
+            "total_employees": total_employees,
+            "present": present_count,
+            "absent": absent_count,
+            "late": late_count,
+            "on_time": present_count - late_count,
+            "met_minimum_hours": met_min_hours_count,
+            "attendance_rate": round((present_count / total_employees * 100), 1) if total_employees > 0 else 0,
+            "compliance_rate": round((met_min_hours_count / present_count * 100), 1) if present_count > 0 else 0,
+            "average_valid_hours": round(avg_hours, 1)
+        },
+        "employees": employee_summaries
+    }
