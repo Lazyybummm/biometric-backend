@@ -5508,18 +5508,24 @@ async def upcoming_holiday(
 FILE: api/routes/org_admin/attendance.py
 ================================================================================
 
+"""
+Org Admin Attendance Routes
+Handles attendance viewing for department administrators
+"""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from datetime import date, datetime
-from typing import Optional
+from datetime import date, datetime, timezone
+from typing import Optional, List, Dict, Any
+
 from app.db.session import get_db
-from app.api.dependencies import get_current_user, require_role
+from app.api.dependencies import require_role
 from app.models.domain import User
 from app.services.tenant_settings_service import (
     get_tenant_settings, 
     calculate_valid_working_hours, 
-    calculate_late_status
+    calculate_late_status,
+    ensure_timezone_aware
 )
 
 router = APIRouter()
@@ -5530,59 +5536,114 @@ async def today_attendance(
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    """Org Admin: Today's attendance for department with working hours calculation"""
-    
-    # Get tenant settings
-    settings = await get_tenant_settings(current_user.tenant_id, db)
-    
-    result = await db.execute(text("""
-        SELECT 
-            u.id, 
-            u.name, 
-            u.employee_code,
-            MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
-            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out
-        FROM users u
-        LEFT JOIN attendance_logs a ON u.id = a.user_id AND DATE(a.timestamp) = CURRENT_DATE
-        WHERE u.tenant_id = :tenant_id 
-        AND u.dept_id = :dept_id 
-        AND u.role = 'employee' 
-        AND u.is_active = true
-        GROUP BY u.id 
-        ORDER BY u.name
-    """), {
-        "tenant_id": current_user.tenant_id, 
-        "dept_id": current_user.dept_id
-    })
-    
-    rows = result.mappings().all()
-    
-    # Calculate working hours for each employee
-    enriched_rows = []
-    for row in rows:
-        valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
-            row["check_in"],
-            row["check_out"],
-            settings
-        )
+    """
+    Org Admin: Today's attendance for department with working hours calculation
+    """
+    try:
+        # Get tenant settings
+        settings = await get_tenant_settings(current_user.tenant_id, db)
         
-        is_late = False
-        if row["check_in"]:
-            is_late, _ = calculate_late_status(row["check_in"], settings)
-        
-        enriched_rows.append({
-            "id": row["id"],
-            "name": row["name"],
-            "employee_code": row["employee_code"],
-            "check_in": row["check_in"],
-            "check_out": row["check_out"],
-            "hours_worked": round(valid_hours, 2),
-            "met_min_hours": met_min_hours,
-            "is_late": is_late,
-            "status": "present" if row["check_in"] else "absent"
+        result = await db.execute(text("""
+            SELECT 
+                u.id, 
+                u.name, 
+                u.employee_code,
+                MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
+                MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out
+            FROM users u
+            LEFT JOIN attendance_logs a ON u.id = a.user_id AND DATE(a.timestamp AT TIME ZONE 'UTC') = CURRENT_DATE
+            WHERE u.tenant_id = :tenant_id 
+            AND u.dept_id = :dept_id 
+            AND u.role = 'employee' 
+            AND u.is_active = true
+            GROUP BY u.id, u.name, u.employee_code
+            ORDER BY u.name
+        """), {
+            "tenant_id": current_user.tenant_id, 
+            "dept_id": current_user.dept_id
         })
-    
-    return enriched_rows
+        
+        rows = result.mappings().all()
+        
+        # Calculate working hours for each employee
+        enriched_rows = []
+        for row in rows:
+            check_in = row["check_in"]
+            check_out = row["check_out"]
+            
+            if check_in is None:
+                enriched_rows.append({
+                    "id": row["id"],
+                    "name": row["name"],
+                    "employee_code": row["employee_code"],
+                    "check_in": None,
+                    "check_out": None,
+                    "hours_worked": 0,
+                    "met_min_hours": False,
+                    "is_late": False,
+                    "status": "absent"
+                })
+                continue
+            
+            # Ensure timestamps are timezone-aware
+            check_in = ensure_timezone_aware(check_in)
+            if check_out:
+                check_out = ensure_timezone_aware(check_out)
+            
+            valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
+                check_in,
+                check_out,
+                settings
+            )
+            
+            is_late, late_msg = calculate_late_status(check_in, settings)
+            
+            enriched_rows.append({
+                "id": row["id"],
+                "name": row["name"],
+                "employee_code": row["employee_code"],
+                "check_in": check_in,
+                "check_out": check_out,
+                "hours_worked": round(valid_hours, 2),
+                "actual_duration": round(actual_duration, 2),
+                "lost_hours": round(lost_hours, 2),
+                "met_min_hours": met_min_hours,
+                "is_late": is_late,
+                "late_message": late_msg,
+                "status_message": status_msg,
+                "status": "present"
+            })
+        
+        # Calculate summary
+        total = len(enriched_rows)
+        present = len([r for r in enriched_rows if r["status"] == "present"])
+        late = len([r for r in enriched_rows if r.get("is_late", False)])
+        met_min = len([r for r in enriched_rows if r.get("met_min_hours", False)])
+        total_hours = sum([r.get("hours_worked", 0) for r in enriched_rows])
+        
+        return {
+            "date": date.today().isoformat(),
+            "summary": {
+                "total_employees": total,
+                "present": present,
+                "absent": total - present,
+                "late": late,
+                "on_time": present - late,
+                "met_minimum_hours": met_min,
+                "attendance_rate": round((present / total * 100), 1) if total > 0 else 0,
+                "compliance_rate": round((met_min / present * 100), 1) if present > 0 else 0,
+                "total_valid_hours": round(total_hours, 1),
+                "average_hours": round(total_hours / present, 1) if present > 0 else 0
+            },
+            "employees": enriched_rows
+        }
+        
+    except Exception as e:
+        import traceback
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error fetching today's attendance: {str(e)}\n{traceback.format_exc()}"
+        )
 
 
 @router.get("/attendance/date/{attendance_date}")
@@ -5591,76 +5652,115 @@ async def attendance_by_date(
     current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db)
 ):
-    """Org Admin: Attendance for specific date with working hours calculation"""
-    
-    # Get tenant settings
-    settings = await get_tenant_settings(current_user.tenant_id, db)
-    
-    result = await db.execute(text("""
-        SELECT 
-            u.id, 
-            u.name, 
-            u.employee_code,
-            MIN(a.timestamp) FILTER (WHERE a.record_type = 'IN') as check_in,
-            MAX(a.timestamp) FILTER (WHERE a.record_type = 'OUT') as check_out
-        FROM users u
-        LEFT JOIN attendance_logs a ON u.id = a.user_id AND DATE(a.timestamp) = :attendance_date
-        WHERE u.tenant_id = :tenant_id 
-        AND u.dept_id = :dept_id 
-        AND u.role = 'employee' 
-        AND u.is_active = true
-        GROUP BY u.id 
-        ORDER BY u.name
-    """), {
-        "tenant_id": current_user.tenant_id,
-        "dept_id": current_user.dept_id,
-        "attendance_date": attendance_date
-    })
-    
-    rows = result.mappings().all()
-    
-    # Calculate working hours for each employee
-    enriched_rows = []
-    for row in rows:
-        valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
-            row["check_in"],
-            row["check_out"],
-            settings
-        )
+    """
+    Org Admin: Attendance for specific date with working hours calculation
+    """
+    try:
+        # Get tenant settings
+        settings = await get_tenant_settings(current_user.tenant_id, db)
         
-        is_late = False
-        if row["check_in"]:
-            is_late, _ = calculate_late_status(row["check_in"], settings)
-        
-        enriched_rows.append({
-            "id": row["id"],
-            "name": row["name"],
-            "employee_code": row["employee_code"],
-            "check_in": row["check_in"],
-            "check_out": row["check_out"],
-            "hours_worked": round(valid_hours, 2),
-            "met_min_hours": met_min_hours,
-            "is_late": is_late,
-            "status": "present" if row["check_in"] else "absent"
+        result = await db.execute(text("""
+            SELECT 
+                u.id, 
+                u.name, 
+                u.employee_code,
+                MIN(CASE WHEN a.record_type = 'IN' THEN a.timestamp END) as check_in,
+                MAX(CASE WHEN a.record_type = 'OUT' THEN a.timestamp END) as check_out
+            FROM users u
+            LEFT JOIN attendance_logs a ON u.id = a.user_id AND DATE(a.timestamp AT TIME ZONE 'UTC') = :attendance_date
+            WHERE u.tenant_id = :tenant_id 
+            AND u.dept_id = :dept_id 
+            AND u.role = 'employee' 
+            AND u.is_active = true
+            GROUP BY u.id, u.name, u.employee_code
+            ORDER BY u.name
+        """), {
+            "tenant_id": current_user.tenant_id,
+            "dept_id": current_user.dept_id,
+            "attendance_date": attendance_date
         })
-    
-    # Calculate summary
-    total = len(enriched_rows)
-    present = len([r for r in enriched_rows if r["check_in"]])
-    met_min = len([r for r in enriched_rows if r["met_min_hours"]])
-    
-    return {
-        "date": attendance_date,
-        "summary": {
-            "total_employees": total,
-            "present": present,
-            "absent": total - present,
-            "met_minimum_hours": met_min,
-            "attendance_rate": round((present / total * 100), 1) if total > 0 else 0,
-            "compliance_rate": round((met_min / present * 100), 1) if present > 0 else 0
-        },
-        "employees": enriched_rows
-    }
+        
+        rows = result.mappings().all()
+        
+        # Calculate working hours for each employee
+        enriched_rows = []
+        for row in rows:
+            check_in = row["check_in"]
+            check_out = row["check_out"]
+            
+            if check_in is None:
+                enriched_rows.append({
+                    "id": row["id"],
+                    "name": row["name"],
+                    "employee_code": row["employee_code"],
+                    "check_in": None,
+                    "check_out": None,
+                    "hours_worked": 0,
+                    "met_min_hours": False,
+                    "is_late": False,
+                    "status": "absent"
+                })
+                continue
+            
+            # Ensure timestamps are timezone-aware
+            check_in = ensure_timezone_aware(check_in)
+            if check_out:
+                check_out = ensure_timezone_aware(check_out)
+            
+            valid_hours, actual_duration, lost_hours, met_min_hours, status_msg = calculate_valid_working_hours(
+                check_in,
+                check_out,
+                settings
+            )
+            
+            is_late, late_msg = calculate_late_status(check_in, settings)
+            
+            enriched_rows.append({
+                "id": row["id"],
+                "name": row["name"],
+                "employee_code": row["employee_code"],
+                "check_in": check_in,
+                "check_out": check_out,
+                "hours_worked": round(valid_hours, 2),
+                "actual_duration": round(actual_duration, 2),
+                "lost_hours": round(lost_hours, 2),
+                "met_min_hours": met_min_hours,
+                "is_late": is_late,
+                "late_message": late_msg,
+                "status_message": status_msg,
+                "status": "present"
+            })
+        
+        # Calculate summary
+        total = len(enriched_rows)
+        present = len([r for r in enriched_rows if r["status"] == "present"])
+        late = len([r for r in enriched_rows if r.get("is_late", False)])
+        met_min = len([r for r in enriched_rows if r.get("met_min_hours", False)])
+        total_hours = sum([r.get("hours_worked", 0) for r in enriched_rows])
+        
+        return {
+            "date": attendance_date.isoformat(),
+            "summary": {
+                "total_employees": total,
+                "present": present,
+                "absent": total - present,
+                "late": late,
+                "on_time": present - late,
+                "met_minimum_hours": met_min,
+                "attendance_rate": round((present / total * 100), 1) if total > 0 else 0,
+                "compliance_rate": round((met_min / present * 100), 1) if present > 0 else 0,
+                "total_valid_hours": round(total_hours, 1),
+                "average_hours": round(total_hours / present, 1) if present > 0 else 0
+            },
+            "employees": enriched_rows
+        }
+        
+    except Exception as e:
+        import traceback
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error fetching attendance for {attendance_date}: {str(e)}\n{traceback.format_exc()}"
+        )
 
 ================================================================================
 FILE: api/routes/org_admin/__init__.py
@@ -6722,7 +6822,7 @@ Tenant Settings Service - Core service for managing and caching tenant settings
 """
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from datetime import datetime, time, date
+from datetime import datetime, time, date, timezone, timedelta
 from typing import Optional, Dict, Any
 import logging
 
@@ -6732,6 +6832,21 @@ logger = logging.getLogger(__name__)
 _settings_cache: Dict[int, Dict[str, Any]] = {}
 _cache_timestamps: Dict[int, datetime] = {}
 CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+def _utc_now() -> datetime:
+    """Get current UTC datetime with timezone"""
+    return datetime.now(timezone.utc)
+
+
+def ensure_timezone_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """Convert naive datetime to timezone-aware UTC datetime"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        # Assume naive datetime is UTC
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 async def get_tenant_settings(
@@ -6746,9 +6861,14 @@ async def get_tenant_settings(
     # Check cache
     if not force_refresh and tenant_id in _settings_cache:
         cached_time = _cache_timestamps.get(tenant_id)
-        if cached_time and (datetime.now() - cached_time).seconds < CACHE_TTL_SECONDS:
-            logger.debug(f"Returning cached settings for tenant {tenant_id}")
-            return _settings_cache[tenant_id].copy()
+        if cached_time:
+            # Ensure cached_time is timezone-aware
+            if cached_time.tzinfo is None:
+                cached_time = cached_time.replace(tzinfo=timezone.utc)
+            now_utc = _utc_now()
+            if (now_utc - cached_time).total_seconds() < CACHE_TTL_SECONDS:
+                logger.debug(f"Returning cached settings for tenant {tenant_id}")
+                return _settings_cache[tenant_id].copy()
     
     # Fetch from database
     result = await db.execute(text("""
@@ -6794,9 +6914,9 @@ async def get_tenant_settings(
         int(d.strip()) for d in settings["working_days"].split(",") if d.strip()
     ]
     
-    # Cache the result
+    # Cache the result - use UTC time with timezone
     _settings_cache[tenant_id] = settings.copy()
-    _cache_timestamps[tenant_id] = datetime.now()
+    _cache_timestamps[tenant_id] = _utc_now()
     
     logger.debug(f"Cached settings for tenant {tenant_id}")
     return settings
@@ -6815,7 +6935,18 @@ def calculate_late_status(
     check_in_time: datetime,
     settings: Dict[str, Any]
 ) -> tuple[bool, str]:
-    """Calculate if a check-in time is considered late."""
+    """
+    Calculate if a check-in time is considered late.
+    Handles both timezone-aware and naive datetimes.
+    """
+    # Ensure check_in_time is timezone-aware
+    check_in_time = ensure_timezone_aware(check_in_time)
+    
+    # Convert to local time for comparison with office hours
+    # Office hours are stored as naive times (e.g., "08:00:00")
+    check_local = check_in_time.astimezone()
+    check_time = check_local.time()
+    
     office_start = settings["office_start"]
     late_threshold = settings["late_threshold_minutes"]
     
@@ -6824,8 +6955,6 @@ def calculate_late_status(
     threshold_hour = total_minutes // 60
     threshold_minute = total_minutes % 60
     threshold_time = time(threshold_hour, threshold_minute)
-    
-    check_time = check_in_time.time()
     
     if check_time > threshold_time:
         return True, f"Late (after {threshold_time.strftime('%H:%M')})"
@@ -6839,35 +6968,41 @@ def calculate_valid_working_hours(
 ) -> tuple[float, float, float, bool, str]:
     """
     Calculate working hours WITHIN official office hours only.
+    Handles both timezone-aware and naive datetimes.
     
     Returns:
         (valid_hours, actual_duration, lost_hours, met_min_hours, status_message)
-        
-    Rules:
-    - If check-in is before office start, count from office start
-    - If check-out is after office end, count until office end
-    - Time outside office hours is NOT counted
     """
     if not check_in_time or not check_out_time:
         return 0.0, 0.0, 0.0, False, "Incomplete attendance"
+    
+    # Ensure both are timezone-aware
+    check_in_time = ensure_timezone_aware(check_in_time)
+    check_out_time = ensure_timezone_aware(check_out_time)
+    
+    # Convert to local time for office hours comparison
+    check_in_local = check_in_time.astimezone()
+    check_out_local = check_out_time.astimezone()
+    work_date = check_in_local.date()
     
     office_start = settings["office_start"]
     office_end = settings["office_end"]
     min_hours = settings.get("min_working_hours", 9.0)
     
-    # Convert to datetime for the same day
-    work_date = check_in_time.date()
-    
-    # Get office boundaries as datetime
+    # Get office boundaries as datetime (using local date)
     office_start_dt = datetime.combine(work_date, office_start)
     office_end_dt = datetime.combine(work_date, office_end)
     
+    # Make timezone-aware (assume local timezone for office hours)
+    office_start_dt = office_start_dt.astimezone()
+    office_end_dt = office_end_dt.astimezone()
+    
     # Actual duration (total time between check-in and check-out)
-    actual_duration = (check_out_time - check_in_time).total_seconds() / 3600
+    actual_duration = (check_out_local - check_in_local).total_seconds() / 3600
     
     # Valid working hours = only time within office hours
-    valid_start = max(check_in_time, office_start_dt)
-    valid_end = min(check_out_time, office_end_dt)
+    valid_start = max(check_in_local, office_start_dt)
+    valid_end = min(check_out_local, office_end_dt)
     
     if valid_end > valid_start:
         valid_hours = (valid_end - valid_start).total_seconds() / 3600
@@ -6875,7 +7010,7 @@ def calculate_valid_working_hours(
         valid_hours = 0
     
     # Calculate lost hours (time outside office hours)
-    lost_hours = actual_duration - valid_hours
+    lost_hours = max(0, actual_duration - valid_hours)
     
     # Check if met minimum working hours requirement
     met_min_hours = valid_hours >= min_hours
@@ -6892,8 +7027,9 @@ def calculate_valid_working_hours(
 def is_working_day(check_date: date, settings: Dict[str, Any]) -> bool:
     """Check if a given date is a working day."""
     python_weekday = check_date.weekday()
-    our_weekday = python_weekday + 1
-    return our_weekday in settings.get("working_days_list", [1, 2, 3, 4, 5])
+    our_weekday = python_weekday + 1  # Monday=1, Sunday=7
+    working_days = settings.get("working_days_list", [1, 2, 3, 4, 5])
+    return our_weekday in working_days
 
 ================================================================================
 FILE: services/notification_service.py
@@ -7113,6 +7249,35 @@ async def notify_multiple_users(
         entity_id=entity_id,
         entity_name=entity_name
     )
+
+================================================================================
+FILE: services/__init__.py
+================================================================================
+
+"""
+Services module exports
+"""
+from app.services.tenant_settings_service import (
+    get_tenant_settings,
+    calculate_valid_working_hours,
+    calculate_late_status,
+    invalidate_tenant_settings_cache,
+    is_working_day,
+    ensure_timezone_aware
+)
+from app.services.attendance_service import (
+    process_attendance,
+    process_bulk_attendance,
+    get_attendance_history,
+    get_today_summary
+)
+from app.services.notification_service import (
+    create_notifications_for_recipients,
+    notify_single_user,
+    notify_department_admins_except_actor,
+    notify_all_department_admins
+)
+from app.services.user_service import enroll_user, delete_user
 
 ================================================================================
 FILE: services/user_service.py

@@ -6,6 +6,7 @@ import logging
 import os
 
 from app.api.routes import auth, attendance
+from app.api.routes import tracker
 from app.api.routes.super_admin import tenants
 from app.api.routes.tenant import (
     dashboard as tenant_dashboard, departments as tenant_departments, org_admins as tenant_org_admins,
@@ -76,6 +77,7 @@ app.include_router(emp_profile.router, prefix="/api/employee", tags=["Employee"]
 app.include_router(emp_leaves.router, prefix="/api/employee", tags=["Employee"])
 app.include_router(emp_holidays.router, prefix="/api/employee", tags=["Employee"])
 app.include_router(emp_notifications.router, prefix="/api/employee", tags=["Employee"])
+app.include_router(tracker.router, prefix="/api", tags=["Tracker"])
 
 app.include_router(attendance.router, prefix="/api/device", tags=["Device"])
 
