@@ -5,9 +5,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from datetime import datetime, time, date, timezone, timedelta
 from typing import Optional, Dict, Any
+import pytz
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Define IST timezone
+IST = pytz.timezone('Asia/Kolkata')
 
 # In-memory cache with TTL
 _settings_cache: Dict[int, Dict[str, Any]] = {}
@@ -28,6 +32,13 @@ def ensure_timezone_aware(dt: Optional[datetime]) -> Optional[datetime]:
         # Assume naive datetime is UTC
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def convert_to_ist(dt: datetime) -> datetime:
+    """Convert any datetime to IST timezone"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
 
 
 async def get_tenant_settings(
@@ -70,19 +81,20 @@ async def get_tenant_settings(
     # Default settings if none found
     if not row:
         settings = {
-            "office_start_time": "09:00:00",
-            "office_end_time": "18:00:00",
+            "office_start_time": "10:00:00",  # Changed to 10:00 AM IST
+            "office_end_time": "17:00:00",    # Changed to 5:00 PM IST
             "late_threshold_minutes": 15,
             "working_days": "1,2,3,4,5",
-            "min_working_hours": 9.0,
+            "min_working_hours": 6.0,         # Changed from 9.0 to 6.0 for 6-hour workday
             "updated_at": None
         }
     else:
         settings = dict(row)
         if settings.get("min_working_hours") is None:
-            settings["min_working_hours"] = 9.0
+            settings["min_working_hours"] = 6.0  # Changed default
     
     # Parse time strings to time objects
+    # These times are stored as IST times in database
     settings["office_start"] = datetime.strptime(
         settings["office_start_time"], "%H:%M:%S"
     ).time()
@@ -99,7 +111,7 @@ async def get_tenant_settings(
     _settings_cache[tenant_id] = settings.copy()
     _cache_timestamps[tenant_id] = _utc_now()
     
-    logger.debug(f"Cached settings for tenant {tenant_id}")
+    logger.debug(f"Cached settings for tenant {tenant_id} with IST office hours {settings['office_start_time']} to {settings['office_end_time']}")
     return settings
 
 
@@ -118,18 +130,18 @@ def calculate_late_status(
 ) -> tuple[bool, str]:
     """
     Calculate if a check-in time is considered late.
-    Handles both timezone-aware and naive datetimes.
+    Uses IST timezone for comparison.
     """
-    # Ensure check_in_time is timezone-aware
-    check_in_time = ensure_timezone_aware(check_in_time)
+    if not check_in_time:
+        return False, "No check-in time"
     
-    # Convert to local time for comparison with office hours
-    # Office hours are stored as naive times (e.g., "08:00:00")
-    check_local = check_in_time.astimezone()
-    check_time = check_local.time()
+    # Ensure check_in_time is timezone-aware and convert to IST
+    check_in_time = ensure_timezone_aware(check_in_time)
+    check_in_ist = check_in_time.astimezone(IST)
+    check_time = check_in_ist.time()
     
     office_start = settings["office_start"]
-    late_threshold = settings["late_threshold_minutes"]
+    late_threshold = settings.get("late_threshold_minutes", 15)
     
     # Calculate threshold time (office start + late threshold)
     total_minutes = office_start.hour * 60 + office_start.minute + late_threshold
@@ -137,8 +149,15 @@ def calculate_late_status(
     threshold_minute = total_minutes % 60
     threshold_time = time(threshold_hour, threshold_minute)
     
-    if check_time > threshold_time:
-        return True, f"Late (after {threshold_time.strftime('%H:%M')})"
+    # Create threshold datetime for comparison
+    threshold_dt = check_in_ist.replace(
+        hour=threshold_hour, minute=threshold_minute, second=0, microsecond=0
+    )
+    
+    if check_in_ist > threshold_dt:
+        late_minutes = int((check_in_ist - threshold_dt).total_seconds() / 60) + late_threshold
+        return True, f"Late by {late_minutes} minutes (after {office_start.strftime('%H:%M')})"
+    
     return False, f"On time (before {threshold_time.strftime('%H:%M')})"
 
 
@@ -149,7 +168,7 @@ def calculate_valid_working_hours(
 ) -> tuple[float, float, float, bool, str]:
     """
     Calculate working hours WITHIN official office hours only.
-    Handles both timezone-aware and naive datetimes.
+    Uses IST timezone for office hour boundaries.
     
     Returns:
         (valid_hours, actual_duration, lost_hours, met_min_hours, status_message)
@@ -157,33 +176,35 @@ def calculate_valid_working_hours(
     if not check_in_time or not check_out_time:
         return 0.0, 0.0, 0.0, False, "Incomplete attendance"
     
-    # Ensure both are timezone-aware
+    # Ensure both are timezone-aware and convert to IST
     check_in_time = ensure_timezone_aware(check_in_time)
     check_out_time = ensure_timezone_aware(check_out_time)
     
-    # Convert to local time for office hours comparison
-    check_in_local = check_in_time.astimezone()
-    check_out_local = check_out_time.astimezone()
-    work_date = check_in_local.date()
+    # Convert to IST for office hour comparison
+    check_in_ist = check_in_time.astimezone(IST)
+    check_out_ist = check_out_time.astimezone(IST)
+    
+    # Get the date for office hours (use check-in date in IST)
+    work_date = check_in_ist.date()
     
     office_start = settings["office_start"]
     office_end = settings["office_end"]
-    min_hours = settings.get("min_working_hours", 9.0)
+    min_hours = settings.get("min_working_hours", 6.0)
     
-    # Get office boundaries as datetime (using local date)
-    office_start_dt = datetime.combine(work_date, office_start)
-    office_end_dt = datetime.combine(work_date, office_end)
+    # Create office boundary datetimes in IST
+    office_start_dt = IST.localize(datetime.combine(work_date, office_start))
+    office_end_dt = IST.localize(datetime.combine(work_date, office_end))
     
-    # Make timezone-aware (assume local timezone for office hours)
-    office_start_dt = office_start_dt.astimezone()
-    office_end_dt = office_end_dt.astimezone()
+    # If check-out is after midnight, adjust office end date
+    if check_out_ist.date() > work_date:
+        office_end_dt = IST.localize(datetime.combine(check_out_ist.date(), office_end))
     
-    # Actual duration (total time between check-in and check-out)
-    actual_duration = (check_out_local - check_in_local).total_seconds() / 3600
+    # Calculate actual duration (total time between check-in and check-out)
+    actual_duration = (check_out_ist - check_in_ist).total_seconds() / 3600
     
     # Valid working hours = only time within office hours
-    valid_start = max(check_in_local, office_start_dt)
-    valid_end = min(check_out_local, office_end_dt)
+    valid_start = max(check_in_ist, office_start_dt)
+    valid_end = min(check_out_ist, office_end_dt)
     
     if valid_end > valid_start:
         valid_hours = (valid_end - valid_start).total_seconds() / 3600
@@ -196,18 +217,23 @@ def calculate_valid_working_hours(
     # Check if met minimum working hours requirement
     met_min_hours = valid_hours >= min_hours
     
-    # Create status message
+    # Create status message with better details
     if lost_hours > 0.1:  # More than 0.1 hour (6 minutes) lost
         status_msg = f"{valid_hours:.1f}h worked within office hours ({lost_hours:.1f}h outside office)"
     else:
-        status_msg = f"{valid_hours:.1f}h worked"
+        status_msg = f"{valid_hours:.1f}h worked within office hours"
+    
+    # Add extra info if minimum not met
+    if not met_min_hours and valid_hours > 0:
+        hours_needed = min_hours - valid_hours
+        status_msg += f" (needs {hours_needed:.1f}h more to meet minimum)"
     
     return valid_hours, actual_duration, lost_hours, met_min_hours, status_msg
 
 
 def is_working_day(check_date: date, settings: Dict[str, Any]) -> bool:
-    """Check if a given date is a working day."""
+    """Check if a given date is a working day (Monday=1, Sunday=7)."""
     python_weekday = check_date.weekday()
-    our_weekday = python_weekday + 1  # Monday=1, Sunday=7
-    working_days = settings.get("working_days_list", [1, 2, 3, 4, 5])
+    our_weekday = python_weekday + 1  # Convert to Monday=1 format
+    working_days = settings.get("working_days_list", [1, 2, 3, 4, 5])  # Monday to Friday
     return our_weekday in working_days
